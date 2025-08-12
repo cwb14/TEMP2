@@ -56,7 +56,7 @@ for(i in recordN){
 	if(record[i,1] && bed[i"/2",1]){
 		if(bed[i"/2",7]>(int((bed[i"/2",3]-bed[i"/2",2]-1)*gdiv/100)+1)){continue};
 		ts=bed[i"/2",2];te=bed[i"/2",3];spl=bed[i"/2",6];
-		if(bed[i"/1",1]==bed[i"/2",1] && spl==0){
+		if(bed[i"/1",1]==bed[i"/2",1] && spl==0 && bed[i"/1",6]==2){
 			if(bed[i"/2",5]=="+" && bed[i"/1",2]>=bed[i"/2",2] && (bed[i"/1",2]-bed[i"/2",2])<fl){
 				ts=bed[i"/1",2];te=bed[i"/1",3];spl=bed[i"/1",6];
 			}else if(bed[i"/2",5]=="-" && bed[i"/2",2]>=bed[i"/1",2] && (bed[i"/2",2]-bed[i"/1",2])<fl){
@@ -64,6 +64,7 @@ for(i in recordN){
 			}
 		};
 		split(record[i,1],t,";");
+		if(spl==2){spl=1};
 		for(j in t){
 			final_record = final_record";"t[j]","spl;
 		};
@@ -71,7 +72,7 @@ for(i in recordN){
 	}else if(record[i,2] && bed[i"/1",1]){
 		if(bed[i"/1",7]>(int((bed[i"/1",3]-bed[i"/1",2]-1)*gdiv/100)+1)){continue};
 		ts=bed[i"/1",2];te=bed[i"/1",3];spl=bed[i"/1",6];
-		if(bed[i"/1",1]==bed[i"/2",1] && spl==0){
+		if(bed[i"/1",1]==bed[i"/2",1] && spl==0 && bed[i"/2",6]==2){
 			if(bed[i"/1",5]=="+" && bed[i"/2",2]>=bed[i"/1",2] && (bed[i"/2",2]-bed[i"/1",2])<fl){
 				ts=bed[i"/2",2];te=bed[i"/2",3];spl=bed[i"/2",6];
 			}else if(bed[i"/1",5]=="-" && bed[i"/1",2]>=bed[i"/2",2] && (bed[i"/1",2]-bed[i"/2",2])<fl){
@@ -79,6 +80,7 @@ for(i in recordN){
 			}
 		};
 		split(record[i,2],t,";");
+		if(spl==2){spl=1};
 		for(j in t){
 			final_record = final_record";"t[j]","spl;
 		};

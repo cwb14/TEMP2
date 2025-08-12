@@ -30,7 +30,7 @@ $echo 6 "\t-p out_prefix\tPrefix to output directory. Default is assigned by the
 $echo 6 "\t-A \t\tSet this parameter to enable ALU mode, which allows the insertion between two concordantly mapped reads"
 $echo 6 "\t-M mismatch%\tPercentage of mismatch allowed when anchor to genome. Default is 2."
 $echo 6 "\t-m mismatch%\tPercentage of mismatch allowed when mapping to TEs. Default is 5."
-$echo 6 "\t-U ratio\tThe ratio between the second best alignment and the best alignment to judge if a read is uniquely mapped. Default is 0.8."
+$echo 6 "\t-U ratio/map_quality\tThe ratio cutoff [0-1] between the second best alignment score and the best alignment score to judge if a read is uniquely mapped. Or map quality cutoff (1-255] to determine if a read is uniquely mapped. By default, if XS tag is available in the alignment/bam file, the ratio mode is enabled and 0.8 is used; otherwise, the map_quality mode is enabled and 5 is used. The second best alignment score is determined by the XS tag output by bwa; for alignment with the XS tag, please use a integer map quality."
 $echo 6 "\t-f frag_length\tFragment length of the library. Default is calculated based on the mapping result."
 $echo 6 "\t-N reference_filter_window\twindow sizea (+-n) for filtering insertions overlapping reference insertions. Default is 300."
 $echo 6 "\t-L\t\tSet this parameter to use a looser criteria to filter reference annotated copy overlapped insertions; Default not allowed."
@@ -135,18 +135,24 @@ else
 	[ ! -f ${BAM}.bai ] && $echo 2 "index bam file" && samtools index -@ ${CPU} ${BAM}
 fi
 
+# When uniquely mapped reads is set by best/second mapping score ratio, check if XS tag exist, otherwise pick up uniquely mapped reads via map quality
+k=(`samtools view ${BAM} | head -1 | grep "XS:i:" | wc -l`)
+[ ${UNIQ_RATIO} -le 1 ] && [ ${k} -lt 1 ] && $echo 4 "-U set to a number less or equal to 1 but no XS tag is found in the bam file, set -U to 5 by default" && UNIQ_RATIO=5
+
 # Get concordant-uniq-split mapped reads
 samtools view -H ${BAM} > ${PREFIX}.tmp.header
 if [ -f ${PREFIX}.pair.uniq.split.fastq ] && [ -f ${PREFIX}.pair.uniq.split.bed ];then
 	$echo 2 "concordant-uniq-split reads exists, skip"
 else
 	$echo 2 "get concordant-uniq-edge-split reads"
-	samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
+	[ ${UNIQ_RATIO} -gt 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
+	[ ${UNIQ_RATIO} -le 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
 	samtools fastq -@ ${CPU} ${PREFIX}.pair.uniq.split.bam | gawk '{if(NR%4==1){print substr($1,1,length($1)-2)"_"substr($1,length($1))}else{print $0}}' - > ${PREFIX}.pair.uniq.split.fastq 
 	bedtools bamtobed -i ${PREFIX}.pair.uniq.split.bam -tag NM | gawk -v div=${MISMATCH} 'BEGIN{FS=OFS="\t"} {$4=substr($4,1,length($4)-2)"_"substr($4,length($4));if($5<=(int(($3-$2-1)*div/100)+1)){if($6=="+"){$6="-"}else{$6="+"};print $0}}' - > ${PREFIX}.pair.uniq.split.bed
 	if [ ${ALU_MODE} ];then
 		$echo 2 "ALU mode enabled, also get concordant-uniq-internal-split reads"
-		samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
+		[ ${UNIQ_RATIO} -gt 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
+		[ ${UNIQ_RATIO} -le 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
 		samtools fastq -@ ${CPU} ${PREFIX}.pair.uniq.split.internal.bam | gawk 'BEGIN{FS=OFS="\t"} {if(NR%4==1){print substr($1,1,length($1)-2)"_"substr($1,length($1))}else{print $0}}' - > ${PREFIX}.tmp
 		${BINDIR}/revertFq.sh ${PREFIX}.tmp >> ${PREFIX}.pair.uniq.split.fastq 
 		bedtools bamtobed -i ${PREFIX}.pair.uniq.split.internal.bam -tag NM | gawk -v div=${MISMATCH} 'BEGIN{FS=OFS="\t"} {$4=substr($4,1,length($4)-2)"_"substr($4,length($4));if($5<=(int(($3-$2-1)*div/100)+1)){print $0}}' - >> ${PREFIX}.pair.uniq.split.bed
