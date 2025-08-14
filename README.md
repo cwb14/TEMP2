@@ -6,7 +6,7 @@ TEMP2 is an algorithm for detecting transposon insertions using short-read whole
 If you use TEMP2 for transposon insertion detection, please cite:  
 Yu et al. A benchmark and an algorithm for detecting germline transposon insertions and measuring *de novo* transposon insertion frequencies. *Nucleic Acid Research*. 2021.  
   
-Current version: v1.0.1
+Current version: v1.0.2
 
 Author: Tianxiong Yu (yutianxiong@gmail.com)   
 If you have any questions or find any bugs please contact Tianxiong Yu through yutianxiong@gmail.com.
@@ -186,9 +186,12 @@ For transposon absence analysis, the summay output file remains exactly the same
 **Column 9**: Estimated population frequency of the detected absence event.  
   
 ## Release information
+**TEMP2-v1.0.2**
+1. Fixed bug: Few split-reads are marked in the wrong direction. Now TEMP2 yeilds more accurate determination of the insertion strand and breakpoint.
+2. TEMP2 used to extract uniquely aligned reads via the ratio of primary/secondary alignment scores (tags AS and XS). In some alignment files, XS tag is not included. Now TEMP2 uses alignment quality by default to extract uniquely aligned reads if XS tag is not available. Read more information from the parameter **-U** of **TEMP2 insertion -h**.
+
 **TEMP2-v1.0.1**
-1. Fixed bug: inaccurate insertion strand annotation in the germline mode through **TEMP2 insertion2**.
-1. Fixed bug: inaccurate insertion strand annotation in the ALU mode through **-A**.
+1. Fixed bug: inaccurate insertion strand annotation in the germline mode through **TEMP2 insertion2** when using the ALU mode through **-A**.
 
 **TEMP2-v1.0.0**
 1. Updated dependency of python2 to python3.
