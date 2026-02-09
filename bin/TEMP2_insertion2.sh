@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# float-safe compare helpers (UNIQ_RATIO can be 0.8 etc)
+gt1(){ awk -v x="$1" 'BEGIN{exit !(x>1)}'; }
+le1(){ awk -v x="$1" 'BEGIN{exit !(x<=1)}'; }
+
 # TEMP2 (Transposable Element Movement present in a Population)
 # 2019-04-04
 # Tianxiong Yu(yutianxiong@gmail.com)
@@ -137,7 +142,12 @@ fi
 
 # When uniquely mapped reads is set by best/second mapping score ratio, check if XS tag exist, otherwise pick up uniquely mapped reads via map quality
 k=(`samtools view ${BAM} | head -1 | grep "XS:i:" | wc -l`)
-[ ${UNIQ_RATIO} -le 1 ] && [ ${k} -lt 1 ] && $echo 4 "-U set to a number less or equal to 1 but no XS tag is found in the bam file, set -U to 5 by default" && UNIQ_RATIO=5
+if awk -v x="${UNIQ_RATIO}" 'BEGIN{exit !(x<=1)}' && [ ${k} -lt 1 ]; then
+	$echo 4 "-U set to a number less or equal to 1 but no XS tag is found in the bam file, set -U to 5 by default"
+	UNIQ_RATIO=5
+fi
+#
+le1 "${UNIQ_RATIO}" && [ ${k} -lt 1 ] && $echo 4 "-U set to a number less or equal to 1 but no XS tag is found in the bam file, set -U to 5 by default" && UNIQ_RATIO=5
 
 # Get concordant-uniq-split mapped reads
 samtools view -H ${BAM} > ${PREFIX}.tmp.header
@@ -145,14 +155,24 @@ if [ -f ${PREFIX}.pair.uniq.split.fastq ] && [ -f ${PREFIX}.pair.uniq.split.bed 
 	$echo 2 "concordant-uniq-split reads exists, skip"
 else
 	$echo 2 "get concordant-uniq-edge-split reads"
-	[ ${UNIQ_RATIO} -gt 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
-	[ ${UNIQ_RATIO} -le 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
+
+if awk -v x="${UNIQ_RATIO}" 'BEGIN{exit !(x>1)}'; then
+	samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
+else
+	samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==0 && $6~/^[0-9]+S/) || (and($2,16)==16 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.bam -
+fi
+
 	samtools fastq -@ ${CPU} ${PREFIX}.pair.uniq.split.bam | gawk '{if(NR%4==1){print substr($1,1,length($1)-2)"_"substr($1,length($1))}else{print $0}}' - > ${PREFIX}.pair.uniq.split.fastq 
 	bedtools bamtobed -i ${PREFIX}.pair.uniq.split.bam -tag NM | gawk -v div=${MISMATCH} 'BEGIN{FS=OFS="\t"} {$4=substr($4,1,length($4)-2)"_"substr($4,length($4));if($5<=(int(($3-$2-1)*div/100)+1)){if($6=="+"){$6="-"}else{$6="+"};print $0}}' - > ${PREFIX}.pair.uniq.split.bed
 	if [ ${ALU_MODE} ];then
 		$echo 2 "ALU mode enabled, also get concordant-uniq-internal-split reads"
-		[ ${UNIQ_RATIO} -gt 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
-		[ ${UNIQ_RATIO} -le 1 ] && samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
+
+if awk -v x="${UNIQ_RATIO}" 'BEGIN{exit !(x>1)}'; then
+	samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {if($5>uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
+else
+	samtools view -@ ${CPU} -h -f 0X2 -F 0X800 ${BAM} | gawk -v uniq_ratio=${UNIQ_RATIO} 'BEGIN{FS=OFS="\t"} {for(i=12;i<=100;i++){if($i~/AS:i:/){as=substr($i,6)};if($i~/XS:i:/){xs=substr($i,6);break}};if(xs/1<as*uniq_ratio){print $0}}' - | grep "SA:Z:" | gawk '(and($2,16)==16 && $6~/^[0-9]+S/) || (and($2,16)==0 && $6~/S$/)' - | cat ${PREFIX}.tmp.header - | samtools view -@ ${CPU} -bhS - | samtools sort -@ ${CPU} -o ${PREFIX}.pair.uniq.split.internal.bam -
+fi
+
 		samtools fastq -@ ${CPU} ${PREFIX}.pair.uniq.split.internal.bam | gawk 'BEGIN{FS=OFS="\t"} {if(NR%4==1){print substr($1,1,length($1)-2)"_"substr($1,length($1))}else{print $0}}' - > ${PREFIX}.tmp
 		${BINDIR}/revertFq.sh ${PREFIX}.tmp >> ${PREFIX}.pair.uniq.split.fastq 
 		bedtools bamtobed -i ${PREFIX}.pair.uniq.split.internal.bam -tag NM | gawk -v div=${MISMATCH} 'BEGIN{FS=OFS="\t"} {$4=substr($4,1,length($4)-2)"_"substr($4,length($4));if($5<=(int(($3-$2-1)*div/100)+1)){print $0}}' - >> ${PREFIX}.pair.uniq.split.bed
@@ -194,7 +214,21 @@ bash $BINDIR/mergeGenomeTEUnpair.sh ${PREFIX}.unpair.uniq.transposon.sam ${PREFI
 ${BINDIR}/fixLTR.sh ${PREFIX}.pair.uniq.split.transposon.bed > ${PREFIX}.pair.uniq.split.transposon.fixLTR.bed
 ${BINDIR}/fixLTR.sh ${PREFIX}.unpair.uniq.transposon.bed > ${PREFIX}.unpair.uniq.transposon.fixLTR.bed
 ${BINDIR}/faToChromSize ${GENOME} > ${PREFIX}.tmp.chr.size
-cat ${PREFIX}.unpair.uniq.transposon.fixLTR.bed ${PREFIX}.pair.uniq.split.transposon.fixLTR.bed | gawk 'BEGIN{FS=OFS="\t"} {print $1,$2,$3,$5,0,$6}' | sort -k1,1 -k2,2n > ${PREFIX}.t && ${BINDIR}/bedToBigBed ${PREFIX}.t ${PREFIX}.tmp.chr.size ${PREFIX}.supportReadsUnfiltered.bb && rm ${PREFIX}.t
+
+# cat ${PREFIX}.unpair.uniq.transposon.fixLTR.bed ${PREFIX}.pair.uniq.split.transposon.fixLTR.bed | gawk 'BEGIN{FS=OFS="\t"} {print $1,$2,$3,$5,0,$6}' | sort -k1,1 -k2,2n > ${PREFIX}.t && ${BINDIR}/bedToBigBed ${PREFIX}.t ${PREFIX}.tmp.chr.size ${PREFIX}.supportReadsUnfiltered.bb && rm ${PREFIX}.t
+
+# Build bigBed-safe BED6 where column 4 (name) is <=255 chars
+# and store the original long payload in a mapping file.
+cat ${PREFIX}.unpair.uniq.transposon.fixLTR.bed ${PREFIX}.pair.uniq.split.transposon.fixLTR.bed \
+| gawk 'BEGIN{FS=OFS="\t"} {
+    id = sprintf("SR%09d", NR);          # short unique ID
+    print id, $5 > "'"${PREFIX}.supportReadsUnfiltered.name_map.tsv"'";   # id -> original long payload
+    print $1,$2,$3,id,0,$6              # BED6 for bigBed (name=id)
+}' \
+| sort -k1,1 -k2,2n > ${PREFIX}.t \
+&& ${BINDIR}/bedToBigBed ${PREFIX}.t ${PREFIX}.tmp.chr.size ${PREFIX}.supportReadsUnfiltered.bb \
+&& rm ${PREFIX}.t
+
 
 # Merge supporting reads within insert size - read length and in the same direction
 $echo 2 "merge support reads in the same direction within ${INSERT} - ${READ_LENGTH}"
@@ -241,9 +275,21 @@ RAWINS_FILTER1P1=(`wc -l ${PREFIX}.insertion.raw.bed`) && FILTER1P1=`expr ${RAWI
 gawk '$7!="singleton"' ${PREFIX}.insertion.raw.bed > ${PREFIX}.t && mv ${PREFIX}.t ${PREFIX}.insertion.raw.bed 
 # filter false positive insertions in high depth regions
 $echo 2 "filter candidate insertions in high depth region"
-bedtools random -g ${PREFIX}.tmp.chr.size -l 200 -n 1000 >${PREFIX}.tmp.random.bed
+# NOTE: bedtools random crashes (std::bad_alloc) on some systems; use deterministic windows instead
+awk 'BEGIN{OFS="\t"; n=0} {for(s=0; s+200<=$2 && n<1000; s+=200){print $1,s,s+200; n++}} END{if(n==0){print "chrNA",0,200}}' ${PREFIX}.tmp.chr.size > ${PREFIX}.tmp.random.bed
 REGIONS=`gawk '{r=r" "$1":"$2"-"$3} END{print r}' ${PREFIX}.tmp.random.bed`
-AVE_DEPTH=`samtools view -bh -F 0X4 -@ ${CPU} ${BAM} ${REGIONS} | bedtools bamtobed -i - | intersectBed -a - -b ${PREFIX}.tmp.random.bed -wo | gawk 'BEGIN{FS=OFS="\t"} {if(ARGIND==1){a[$10]++}else{s+=a[$4]}} END{print s/1000}' - ${PREFIX}.tmp.random.bed`
+AVE_DEPTH=$(
+  samtools view -bh -F 0x4 -@ ${CPU} ${BAM} ${REGIONS} \
+  | bedtools bamtobed -i - \
+  | bedtools intersect -a ${PREFIX}.tmp.random.bed -b - -c \
+  | awk '{sum+=$4} END{ if(NR>0) print sum/NR; else print 0 }'
+)
+
+if awk -v d="${AVE_DEPTH}" 'BEGIN{exit !(d<=0)}'; then
+	$echo 4 "WARNING: estimated AVE_DEPTH=${AVE_DEPTH}; forcing to 1 to avoid filtering everything"
+	AVE_DEPTH=1
+fi
+
 CTOF_DEPTH=`gawk -v t=${AVE_DEPTH} 'BEGIN{print t*5}'` && $echo 3 "average read number for 200bp bins is ${AVE_DEPTH}, set read number cutoff to ${CTOF_DEPTH}"
 gawk 'BEGIN{FS=OFS="\t"} {s=int(($2+$3)/2)-100;e=int(($2+$3)/2)+100;if(s<0){s=0};print $1,s,e,$1","$2","$3","$4","$6,0,"+"}' ${PREFIX}.insertion.raw.bed > ${PREFIX}.tmp
 gawk 'BEGIN{FS=OFS="\t"} {print $1,$2,$3}' ${PREFIX}.tmp | sort -k1,1 -k2,2n | bedtools merge -i - > ${PREFIX}.t
@@ -290,7 +336,19 @@ intersectBed -a ${PREFIX}.tmp -b ${PREFIX}.tmp.bed -f 1 -c | gawk 'BEGIN{FS=OFS=
 $echo 2 "get TSD, remove redundant insertions and recalculate somatic insertion rate"
 gawk 'BEGIN{FS=OFS="\t"} {if($14!="unknown"){split($14,a,":");split(a[2],b,"-");print a[1],b[1],b[2],NR,0,"."}}' ${PREFIX}.insertion.bed | bedtools getfasta -fi ${GENOME} -bed - -fo ${PREFIX}.tmp -name
 gawk 'BEGIN{FS=OFS="\t"} {if(ARGIND==1){if(NR%2==1){i=substr($1,2)}else{seq[i]=$0}}else{if(seq[FNR]){$14=toupper(seq[FNR])};print $0}}' ${PREFIX}.tmp ${PREFIX}.insertion.bed  | gawk 'BEGIN{FS=OFS="\t"} {if($2==$3){$3=$3+1};print $0}' | ${BINDIR}/removeRedundantIns.sh - | gawk 'BEGIN{FS=OFS="\t";print "#Chr\tStart\tEnd\tTransposon:Start:End:Strand\tFrequency\tStrand\tType\tSupportReads\tUnspportReads\t5primeSupportReads\t3primeSupportReads\tTSD\tConfidenceForSomaticInsertion\t5splicSiteSupportReads\t3spiceSiteSupportReads"} {print $0}'> ${PREFIX}.t && mv ${PREFIX}.t ${PREFIX}.insertion.bed 
-gawk 'BEGIN{FS=OFS="\t"} {print $1,$2,$3,$4";"$5";"$7,0,$6}' ${PREFIX}.insertion.bed | sort -k1,1 -k2,2n > ${PREFIX}.t && ${BINDIR}/bedToBigBed ${PREFIX}.t ${PREFIX}.tmp.chr.size ${PREFIX}.insertion.bb && rm ${PREFIX}.t
+
+# Build bigBed-safe BED6 for insertions where name (col4) must be <=255 chars.
+# Store original long name payload in a mapping file.
+gawk 'BEGIN{FS=OFS="\t"} NR==1{next} {              # skip header line starting with "#Chr"
+    id = sprintf("INS%09d", ++n);                   # short unique ID
+    orig = $4";"$5";"$7;                           # original long name payload
+    print id, orig > "'"${PREFIX}.insertion.name_map.tsv"'";
+    print $1,$2,$3,id,0,$6
+}' ${PREFIX}.insertion.bed \
+| sort -k1,1 -k2,2n > ${PREFIX}.t \
+&& ${BINDIR}/bedToBigBed ${PREFIX}.t ${PREFIX}.tmp.chr.size ${PREFIX}.insertion.bb \
+&& rm ${PREFIX}.t
+
 
 # Fix 2p insertions to full length
 gawk 'BEGIN{FS=OFS="\t"} {if(ARGIND==1){te[$1]=$2}else{if($7=="2p"){split($4,a,",");$4="";for(i=1;i<=length(a);i++){split(a[i],b,":");$4=$4","b[1]":1:"te[b[1]]":"b[4]};$4=substr($4,2)};print $0}}' ${PREFIX}.tmp.te.size ${PREFIX}.insertion.bed > ${PREFIX}.t && mv ${PREFIX}.t ${PREFIX}.insertion.bed
@@ -299,3 +357,5 @@ gawk 'BEGIN{FS=OFS="\t"} {if(ARGIND==1){te[$1]=$2}else{if($7=="2p"){split($4,a,"
 $echo 2 "clean tmp files"
 ${BINDIR}/cleanTempFiles.sh ${PREFIX} ${CLEAN}
 $echo 5 "Done, Congras!!!🍺🍺🍺"
+
+

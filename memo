@@ -1,0 +1,48 @@
+# Get genome.
+wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/010/389/155/GCF_010389155.1_C_canadensis_v1/GCF_010389155.1_C_canadensis_v1_genomic.fna.gz
+
+# Unnested LTR-RTs.
+nohup python ltrharvest.py --genome ref.fa --proteins ref.pep --threads 120 --out-prefix ref_ltr --scn-min-ltr-len 100 --scn-min-ret-len 800 --scn-max-ret-len 15000 --scn-min-int-len 500 --scn-max-int-len 12000 &
+
+# Single-nest LTR-RTs.
+python mask_ltr.py --features-fasta ref_ltr.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome ref.fa --feature-character N --far-character V --distance 15000 > ref_r1.fa
+python ltrharvest.py --require-run-chars N --genome ref_r1.fa --proteins ref.pep --threads 200 --out-prefix ref_r2 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 30000 --scn-min-int-len 500 --scn-max-int-len 28000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 30000' --ltrfinder-args '-w 2 -C -D 30000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+
+# Double-nest LTR-RTs
+python mask_ltr.py --features-fasta ref_r2.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome ref.fa --feature-character R --far-character V --distance 15000 > ref_r2.fa
+python ltrharvest.py --require-run-chars N,R --genome ref_r2.fa --proteins ref.pep --threads 100 --out-prefix ref_r3 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 45000 --scn-min-int-len 500 --scn-max-int-len 43000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 45000' --ltrfinder-args '-w 2 -C -D 45000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+
+# Triple-nest LTR-RTs
+python mask_ltr.py --features-fasta ref_r3.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa --genome ref.fa --feature-character D --far-character V --distance 15000 > ref_r3.fa
+python ltrharvest.py --require-run-chars N,R,D --genome ref_r3.fa --proteins ref.pep --threads 100 --out-prefix ref_r4 --scn-min-ltr-len 100 --scn-min-ret-len 1000 --scn-max-ret-len 50000 --scn-min-int-len 500 --scn-max-int-len 50000 --ltrharvest-args '-mindistltr 100 -minlenltr 100 -maxlenltr 7000 -mintsd 4 -maxtsd 6 -similar 70 -vic 30 -seed 15 -seqids yes -xdrop 10 -maxdistltr 50000' --ltrfinder-args '-w 2 -C -D 50000 -d 100 -L 7000 -l 100 -p 20 -M 0.00 -S 0.0'
+
+## Merge them
+# Remove masked bases from nested. 
+cat ref*.ltrharvest.full_length.dedup.fa.rexdb-plant.cls.lib.fa | sed '/^>/! { s/[^ATCGatcg]//g; /^$/d }' > ref_all.fa
+# Remove header characters that cause issue for consensus.
+sed '/^>/ s/#.*//' ref_all.fa > ref_all2.fa
+cat ref_all2.fa | sed 's/:/_/g' > ref_all3.fa
+# Merge with EDTA. 
+cat ref.fa.mod.EDTA.intact.fa ref_all3.fa | sed '/^>/ s/#.*//' | sed 's/:/_/g' > ref_all4.fa
+
+# Create consensus library.
+bash ./consensus_ltrrt_library2.sh -i ref_all4.fa -o TE_consensus_out4 -p LTRRT -t 232 --min-seq-id 0.80 -c 0.80 --cov-mode 0 --cluster-mode 0 --mafft-mode auto --fancy
+
+# Use consensus lib as input to Repeatmasker. 
+RepeatMasker -pa 70 -lib TE_consensus_out4/LTRRT.consensus.fa -no_is ref.fa
+
+# Convert Repeatmasker TE annotations to bed6. 
+awk 'BEGIN{OFS="\t"}
+     NR<=2 || $0 ~ /^[[:space:]]*$/ {next}                 # skip headers/blank
+     $11=="Simple_repeat" {next}                           # skip simple repeats
+     {
+       chr=$5
+       start=$6-1
+       end=$7
+       name=$10
+       score=0
+       strand=($9=="C" ? "-" : $9)
+       print chr, start, end, name, score, strand
+     }' ref.fa.out > ref.fa.out.bed6
+     
+# Now I have a non-redundant consensus TE library + TE annotation coordinates for input to TEMP2.
