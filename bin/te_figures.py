@@ -1253,22 +1253,28 @@ def panel_gly_violin(ax, merged, gly_col, col_prefix, title, panel_letter,
         else:
             n_resistant = n_grp
 
-    # significance testing remains on RAW counts
+    # significance testing remains on RAW counts (Bonferroni-corrected)
     y_range = y_tops.max() - y_tops.min() if y_tops.max() > 0 else 1
+    raw_pvals = []
     for ci, fc in enumerate(top_cols):
         s_d = sub[sub[gly_col] == "Susceptible"][fc].dropna().values
         r_d = sub[sub[gly_col] == "Resistant"][fc].dropna().values
         if len(s_d) >= 3 and len(r_d) >= 3:
             try:
                 _, pval = stats.mannwhitneyu(s_d, r_d, alternative="two-sided")
-                sig = ("***" if pval < 0.001 else "**" if pval < 0.01
-                       else "*" if pval < 0.05 else "")
-                if sig:
-                    ax.text(ci, y_tops[ci] + y_range * 0.05, sig,
-                            ha="center", va="bottom", fontsize=8,
-                            color="#333", fontweight="bold")
+                raw_pvals.append((ci, pval))
             except Exception:
                 pass
+
+    n_tests_mw = len(raw_pvals)
+    for ci, pval in raw_pvals:
+        padj = min(pval * n_tests_mw, 1.0)
+        sig = ("***" if padj < 0.001 else "**" if padj < 0.01
+               else "*" if padj < 0.05 else "")
+        if sig:
+            ax.text(ci, y_tops[ci] + y_range * 0.05, sig,
+                    ha="center", va="bottom", fontsize=8,
+                    color="#333", fontweight="bold")
 
     x_label = "LTR-RT Clade" if "clade" in col_prefix else "TE Family"
     cat_labels = [fc.replace(col_prefix, "") for fc in top_cols]
@@ -2577,4 +2583,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
