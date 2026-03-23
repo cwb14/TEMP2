@@ -924,8 +924,8 @@ def find_enriched_clusters(pos_df, gly_map, window=5, min_samples=2, alpha=0.05)
     if pos_df.empty:
         return pd.DataFrame()
 
-    n_R = sum(v for v in gly_map.values())
-    n_S = sum(not v for v in gly_map.values())
+    n_R = sum(1 for v in gly_map.values() if v is True)
+    n_S = sum(1 for v in gly_map.values() if v is False)
     if n_R == 0 or n_S == 0:
         return pd.DataFrame()
 
@@ -946,8 +946,9 @@ def find_enriched_clusters(pos_df, gly_map, window=5, min_samples=2, alpha=0.05)
         def _flush(cs, ce, csids):
             if len(csids) < min_samples:
                 return
-            r_with    = sum(gly_map.get(s, False) for s in csids)
-            s_with    = len(csids) - r_with
+            known = {s for s in csids if gly_map.get(s) is not None}
+            r_with    = sum(1 for s in known if gly_map[s] is True)
+            s_with    = sum(1 for s in known if gly_map[s] is False)
             r_without = n_R - r_with
             s_without = n_S - s_with
             try:
@@ -1593,7 +1594,7 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None):
             lp = np.clip(-np.log10(s_cl["padj"].clip(lower=1e-30).values), 0, 5)
             ax.vlines(s_cl["pos"].values,
                       y - BAR_H - TICK_H * lp / 5, y - BAR_H,
-                      color="#2255CC", lw=0.9, alpha=0.85, zorder=3)
+                      color="#2255CC", lw=1.4, alpha=0.9, zorder=3)
 
     # ── known variant marker (NC_057763.1 : 38,804,274) ─────────────────────
     KNOWN_VAR = {"NC_057763.1": 38_804_274}
@@ -2522,19 +2523,24 @@ def main():
     pos_df = load_all_bed_positions(merged, args.te_pattern, args.awk_filter)
     print(f"    {len(pos_df):,} total insertion records")
 
-    # Build glyphosate resistance map {sample_id: bool}
+    # Build glyphosate resistance map {sample_id: True/False/None}
+    # None = unknown (NA); only True/False samples are used in R/S analyses.
     gly_map = {}
     for sid in merged.index:
-        is_r = False
+        is_r = None
         for gcol in ["Glyphosate_R", "glyphosate_res"]:
             if gcol in merged.columns:
-                if str(merged.loc[sid, gcol]).strip() in ("1", "1.0", "R", "Resistant"):
+                val = str(merged.loc[sid, gcol]).strip()
+                if val in ("1", "1.0", "R", "Resistant"):
                     is_r = True
+                    break
+                elif val in ("0", "0.0", "S", "Susceptible"):
+                    is_r = False
                     break
         gly_map[sid] = is_r
 
-    n_r_samp = sum(gly_map.values())
-    n_s_samp = sum(not v for v in gly_map.values())
+    n_r_samp = sum(1 for v in gly_map.values() if v is True)
+    n_s_samp = sum(1 for v in gly_map.values() if v is False)
     print(f"    Resistant: {n_r_samp} samples  |  Susceptible: {n_s_samp} samples")
 
     clusters_df = find_enriched_clusters(pos_df, gly_map)
