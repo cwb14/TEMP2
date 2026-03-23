@@ -180,6 +180,8 @@ VAR_DESC = {
 
 
 GENE_CONTEXT_WINDOW_BP = 1000
+#GENE_CONTEXT_WINDOW_BP = 2000
+#GENE_CONTEXT_WINDOW_LABEL = "2kb"
 GENE_CONTEXT_WINDOW_LABEL = "1kb"
 
 CONTEXT_ORDER = [
@@ -430,6 +432,35 @@ def load_gff_full(path):
         exon_intervals[gene_id] = np.array(merged, dtype=np.int64)
 
     return genes_df, exon_intervals
+
+
+def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW_BP):
+    """Return total base-pairs (in kb) for each gene context across all genes.
+
+    Used to normalise raw insertion counts to density (insertions per kb) so
+    that contexts of different lengths are directly comparable.
+
+    Keys match CONTEXT_ORDER: Exonic, Intronic, Upstream …, Downstream …
+    """
+    n_genes = len(genes_df)
+    total_exon_bp   = 0
+    total_intron_bp = 0
+    for row in genes_df.itertuples(index=False):
+        gene_bp = int(row.end) - int(row.start) + 1
+        exons   = exon_intervals.get(row.gene_id)
+        if exons is not None and len(exons):
+            exon_bp = int(np.sum(exons[:, 1] - exons[:, 0] + 1))
+        else:
+            exon_bp = 0
+        total_exon_bp   += exon_bp
+        total_intron_bp += max(0, gene_bp - exon_bp)
+
+    return {
+        "Exonic":                                  max(total_exon_bp,   1) / 1000,
+        "Intronic":                                max(total_intron_bp, 1) / 1000,
+        f"Upstream {GENE_CONTEXT_WINDOW_LABEL}":   (n_genes * window)   / 1000,
+        f"Downstream {GENE_CONTEXT_WINDOW_LABEL}": (n_genes * window)   / 1000,
+    }
 
 
 def compute_gene_disruptions(pos_df, genes_df, exon_intervals):
@@ -1751,7 +1782,8 @@ def panel_context_bar(ax, comp_df, palette, panel_letter, top_n=10, label=None):
 CONTEXTS = CONTEXT_ORDER
 
 def panel_context_enrichment(ax, comp_df, panel_letter, top_n=10, label=None,
-                             show_xticklabels=True, top_cats_override=None):
+                             show_xticklabels=True, top_cats_override=None,
+                             context_lengths_kb=None):
     """Log₂-enrichment heatmap: observed vs expected context proportion per category.
 
     comp_df rows = contexts, columns = family or clade names (raw counts).
@@ -1775,8 +1807,16 @@ def panel_context_enrichment(ax, comp_df, panel_letter, top_n=10, label=None,
     top_cols = [c for c in top_cols if c in df.columns]
     df = df[top_cols]
 
+    # Length-normalise to insertion density (per kb) so that exons/introns
+    # (variable length) are directly comparable to fixed up/downstream windows.
+    if context_lengths_kb:
+        df = df.astype(float)
+        for ctx in list(df.index):
+            if ctx in context_lengths_kb:
+                df.loc[ctx] = df.loc[ctx] / context_lengths_kb[ctx]
+
     # Expected proportions: genome-wide average across all categories
-    genome_total = df.sum(axis=1)  # total per context
+    genome_total = df.sum(axis=1)  # total density per context
     expected = genome_total / genome_total.sum()
     expected = expected.clip(lower=1e-10)
 
@@ -1833,7 +1873,8 @@ CONTEXT_COLORS = ["#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00"]
 
 
 def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
-                              show_xticklabels=True, top_cats_override=None):
+                              show_xticklabels=True, top_cats_override=None,
+                              context_lengths_kb=None):
     """Grouped violin plot of per-sample context *proportions* per category.
 
     For each sample × category, the raw counts are normalised to proportions
@@ -1858,6 +1899,13 @@ def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
     pivot = df.pivot_table(index=["sample_id", "category"],
                            columns="context", values="count",
                            fill_value=0, aggfunc="sum")
+    # Length-normalise to insertion density (per kb) before computing proportions,
+    # so that fixed-length upstream/downstream regions are comparable to variable-
+    # length exons and introns.
+    if context_lengths_kb:
+        for ctx in list(pivot.columns):
+            if ctx in context_lengths_kb:
+                pivot[ctx] = pivot[ctx] / context_lengths_kb[ctx]
     # Normalise each row to proportions
     row_sums = pivot.sum(axis=1).replace(0, 1)
     prop = pivot.div(row_sums, axis=0)
@@ -1928,7 +1976,8 @@ def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
         ax.set_xticklabels(top_cats, fontsize=6.5, rotation=35, ha="right")
     else:
         ax.set_xticklabels([])
-    ax.set_ylabel("Context Proportion", fontsize=7)
+    ax.set_ylabel("Context Proportion\n(normalized density)" if context_lengths_kb
+                  else "Context Proportion", fontsize=7)
     ax.set_ylim(-0.05, 1.05)
     ax.yaxis.set_major_formatter(
         matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:.0%}"))
@@ -2256,6 +2305,12 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
             window=GENE_CONTEXT_WINDOW_BP
         )
 
+    print("    Computing context region lengths for density normalisation …")
+    ctx_lengths_kb = compute_context_lengths(genes_df, exon_intervals,
+                                             window=GENE_CONTEXT_WINDOW_BP)
+    print("    Context lengths (kb): " +
+          ", ".join(f"{k}: {v:,.1f}" for k, v in ctx_lengths_kb.items()))
+
     # Canonical region order (same rule as page 1 panel C / page 6 panel A)
     reg_order = _canonical_region_order(merged)
 
@@ -2316,11 +2371,13 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
     panel_context_prop_violin(ax_B_violin, fam_long,
                               panel_letter="B", top_n=10,
                               show_xticklabels=False,
-                              top_cats_override=top_fams)
+                              top_cats_override=top_fams,
+                              context_lengths_kb=ctx_lengths_kb)
     panel_context_enrichment(ax_B_heat, fam_comp_df,
                              panel_letter=None, top_n=10, label="TE Family",
                              show_xticklabels=True,
-                             top_cats_override=top_fams)
+                             top_cats_override=top_fams,
+                             context_lengths_kb=ctx_lengths_kb)
     # Align x-limits so violin positions and heatmap columns line up
     ax_B_violin.set_xlim(-0.5, n_fams - 0.5)
     ax_B_heat.set_xlim(-0.5, n_fams - 0.5)
@@ -2339,11 +2396,13 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
     panel_context_prop_violin(ax_C_violin, clade_long,
                               panel_letter="C", top_n=12,
                               show_xticklabels=False,
-                              top_cats_override=top_clades)
+                              top_cats_override=top_clades,
+                              context_lengths_kb=ctx_lengths_kb)
     panel_context_enrichment(ax_C_heat, clade_comp_df,
                              panel_letter=None, top_n=12, label="LTR-RT Clade",
                              show_xticklabels=True,
-                             top_cats_override=top_clades)
+                             top_cats_override=top_clades,
+                             context_lengths_kb=ctx_lengths_kb)
     ax_C_violin.set_xlim(-0.5, n_clades - 0.5)
     ax_C_heat.set_xlim(-0.5, n_clades - 0.5)
 
