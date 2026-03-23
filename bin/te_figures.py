@@ -212,7 +212,37 @@ def parse_args():
     p.add_argument("--gff",        default=None,
                    help="GFF3 annotation file to check whether enriched "
                         "insertions fall inside a gene or its promoter (1 kb).")
+    p.add_argument("--crm",        default=None,
+                   help="CRM element file (one entry per line, format "
+                        "'chr:start-end#LTR/Gypsy/CRM') used to overlay "
+                        "centromere-proximal regions on the karyotype (page 5).")
     return p.parse_args()
+
+
+# ── CRM loader ──────────────────────────────────────────────────────────────
+
+def parse_crm(path):
+    """Parse a CRM element file into a dict {chrom: [(start, end), ...]}.
+
+    Accepted line format (one per line):
+        chr:start-end#anything      e.g. NC_057761.1:498719-504450#LTR/Gypsy/CRM
+    Lines that don't match are silently skipped.
+    """
+    import re as _re
+    pattern = _re.compile(r'^([^:]+):(\d+)-(\d+)')
+    intervals = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            m = pattern.match(line)
+            if not m:
+                continue
+            chrom = m.group(1)
+            start, end = int(m.group(2)), int(m.group(3))
+            intervals.setdefault(chrom, []).append((start, end))
+    return intervals
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -1508,7 +1538,7 @@ def panel_sample_stacked(ax, merged, col_prefix="te_fam_", top_n=10,
     ax.grid(axis="y", alpha=0)
 
 
-def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None):
+def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     """
     Linear karyotype: one horizontal bar per chromosome (stacked vertically).
     R-enriched insertions → red ticks above bar.
@@ -1516,9 +1546,12 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None):
     Non-significant clusters → hairline grey marks on bar.
     Tick height scales with −log10(padj), capped at 5.
 
-    fai_lengths : dict {chr_name: length} from a samtools FAI file.
-                  When provided, used as authoritative chromosome lengths.
-                  Otherwise lengths are inferred from max observed End position.
+    fai_lengths   : dict {chr_name: length} from a samtools FAI file.
+                    When provided, used as authoritative chromosome lengths.
+                    Otherwise lengths are inferred from max observed End position.
+    crm_intervals : dict {chr_name: [(start, end), ...]} CRM element coordinates.
+                    Drawn as semi-transparent purple bands on the chromosome bar
+                    to approximate centromere locations.
     """
     # ── chromosome lengths ───────────────────────────────────────────────────
     if fai_lengths:
@@ -1564,6 +1597,27 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None):
         # Chromosome label — use full accession name
         ax.text(-max_len * 0.01, y, chrom,
                 ha="right", va="center", fontsize=6.5, color="#333")
+
+        # CRM density heatmap: bin midpoints → Gaussian-smooth → imshow on bar.
+        # Dark purple = dense CRMs → likely centromere; near-white = sparse.
+        if crm_intervals and chrom in crm_intervals:
+            from scipy.ndimage import gaussian_filter1d as _gf1d
+            N_BINS = 400
+            midpoints = [(s + e) / 2 for s, e in crm_intervals[chrom]]
+            counts, _ = np.histogram(midpoints, bins=N_BINS, range=(0, chr_len))
+            smoothed = _gf1d(counts.astype(float), sigma=N_BINS * 0.02)
+            if smoothed.max() > 0:
+                smoothed /= smoothed.max()
+            ax.imshow(
+                smoothed[np.newaxis, :],
+                aspect="auto",
+                extent=[0, chr_len, y - BAR_H * 0.92, y + BAR_H * 0.92],
+                cmap="Purples",
+                vmin=0, vmax=1,
+                zorder=2,
+                origin="lower",
+                alpha=0.85,
+            )
 
         if clusters_df.empty:
             continue
@@ -1638,6 +1692,12 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None):
                marker="v", markersize=6, markerfacecolor="#FF8C00",
                label="Known resistance variant (NC_057763.1:38,804,274)"),
     ]
+    if crm_intervals:
+        n_crm = sum(len(v) for v in crm_intervals.values())
+        legend_elements.append(
+            Patch(facecolor="#9B59B6", alpha=0.85, edgecolor="none",
+                  label=f"CRM density  (n={n_crm})")
+        )
     ax.legend(handles=legend_elements, loc="lower right",
               fontsize=7.5, framealpha=0.92, edgecolor="#cccccc",
               bbox_to_anchor=(1.0, 0.0))
@@ -2270,12 +2330,13 @@ def build_page4(pdf, merged):
     plt.close(fig)
 
 
-def build_page6(pdf, clusters_df, pos_df, fai_lengths=None):
+def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     """Page 6: linear karyotype with R/S-enriched insertion positions."""
     fig = plt.figure(figsize=(11, 8.5))
     fig.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.06)
     ax = fig.add_subplot(111)
-    panel_karyotype(ax, clusters_df, pos_df, fai_lengths=fai_lengths)
+    panel_karyotype(ax, clusters_df, pos_df, fai_lengths=fai_lengths,
+                    crm_intervals=crm_intervals)
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
@@ -2507,6 +2568,17 @@ def main():
     n_fam   = sum(1 for c in merged.columns if c.startswith("te_fam_"))
     print(f"    te_clade_* cols: {n_clade}  te_fam_* cols: {n_fam}")
 
+    # ── optional CRM file for centromere approximation ───────────────────────
+    crm_intervals = None
+    if args.crm:
+        try:
+            crm_intervals = parse_crm(args.crm)
+            n_crm = sum(len(v) for v in crm_intervals.values())
+            print(f"\n[2b] CRM file loaded: {n_crm} elements across "
+                  f"{len(crm_intervals)} chromosomes from {args.crm}")
+        except Exception as e:
+            print(f"\n[2b] WARNING: could not read CRM file ({e}); skipping")
+
     # ── optional FAI for authoritative chromosome lengths ─────────────────────
     fai_lengths = None
     if args.fai:
@@ -2629,7 +2701,8 @@ def main():
         print("    Page 4: per-sample stacked bars (family + clade, side-by-side)")
         build_page4(pdf, merged)
         print("    Page 5: karyotype enrichment plot")
-        build_page6(pdf, clusters_df, pos_df, fai_lengths=fai_lengths)
+        build_page6(pdf, clusters_df, pos_df, fai_lengths=fai_lengths,
+                    crm_intervals=crm_intervals)
         if args.gff:
             print("    Page 6: gene-context disruptions, metagene & enrichment")
             build_page_gene_context(pdf, merged, pos_df, args.gff)
