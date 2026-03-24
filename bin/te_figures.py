@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+https://www.nature.com/articles/s41467-025-64944-4
+https://onlinelibrary.wiley.com/doi/epdf/10.1111/pbi.13926
+https://academic.oup.com/plcell/article/36/4/840/7456361 # 441 TE presences;  5,306 to 6,528 polymorphic TEs.
+https://cdn.elifesciences.org/articles/15716/elife-15716-v2.pdf # 2835 non-reference TE insertions with TSDs identified in total.
+https://www.nature.com/articles/s41467-020-17874-2.pdf # 6906
+https://link.springer.com/article/10.1186/s12864-017-4103-x # 274,408
+
 TE Insertion Analysis – Publication Figure Generator
 ====================================================
 Five-page multi-panel PDF from TEMP2 TE insertion BED files + master TSV.
@@ -2671,6 +2678,71 @@ def build_page_sample_sharing(pdf, pos_df, gly_map, merged=None):
     plt.close(fig)
 
 
+def build_page_insertion_spectrum(pdf, pos_df):
+    """
+    TE insertion cluster frequency spectrum.
+    x = number of samples sharing a cluster (1 = singleton, 2 = doubleton, …)
+    y = number of clusters with that sample count (log scale).
+    """
+    from collections import Counter
+    import matplotlib.ticker as mticker
+
+    mat = build_sample_presence_matrix(pos_df)
+    if mat.empty:
+        return
+
+    # Number of samples per cluster (column sums of binary matrix)
+    per_cluster = mat.values.sum(axis=0).astype(int)
+    spectrum    = Counter(per_cluster.tolist())
+
+    max_count = int(max(spectrum.keys()))
+    xs = list(range(1, max_count + 1))
+    ys = [spectrum.get(k, 0) for k in xs]
+
+    n_total  = int(sum(spectrum.values()))
+    n_sing   = spectrum.get(1, 0)
+    n_shared = n_total - n_sing
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig.subplots_adjust(left=0.09, right=0.97, top=0.93, bottom=0.13)
+
+    ax.bar(xs, ys, color=PALETTE[0], edgecolor="none", width=0.85)
+
+    ax.set_yscale("log")
+    # Explicitly pin y-ticks to powers of 10 only — bypasses auto-locator
+    import math as _math
+    _pow10 = [10**i for i in range(0, _math.ceil(_math.log10(max(ys))) + 1)]
+    ax.set_yticks(_pow10)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: f"{int(v):,}"))
+    ax.yaxis.set_minor_locator(mticker.NullLocator())
+    ax.set_xlim(0.3, max_count + 0.7)
+    ax.set_xlabel("Number of samples in TE insertion cluster")
+    ax.set_ylabel("Number of insertion clusters (log scale)")
+
+    # Clean integer x-ticks: use MaxNLocator then force x=1 to always appear,
+    # ensuring no duplicate/collision at either end.
+    locator = mticker.MaxNLocator(integer=True, nbins=12, prune="both")
+    locator.set_params(min_n_ticks=5)
+    ax.xaxis.set_major_locator(locator)
+    fig.canvas.draw()                        # populate tick positions
+    ticks = [t for t in ax.get_xticks() if 1 <= t <= max_count]
+    if ticks and ticks[0] != 1:
+        ticks = [1] + ticks
+    ax.set_xticks(ticks)
+
+    fig.text(
+        0.5, 0.01,
+        f"Total clusters: {n_total:,}  ·  "
+        f"Singletons: {n_sing:,} ({100*n_sing/n_total:.1f}%)  ·  "
+        f"Shared (≥2 samples): {n_shared:,} ({100*n_shared/n_total:.1f}%)",
+        ha="center", va="bottom", fontsize=7.5, color="#555",
+    )
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
 def build_page_kary_sharing(pdf, clusters_df, pos_df,
                             fai_lengths, crm_intervals,
                             gly_map, merged=None):
@@ -3252,6 +3324,8 @@ def main():
                                 fai_lengths=fai_lengths,
                                 crm_intervals=crm_intervals,
                                 gly_map=gly_map, merged=merged)
+        print("    Page 5b: insertion cluster frequency spectrum")
+        build_page_insertion_spectrum(pdf, pos_df)
         if args.gff:
             print("    Page 6: gene-context disruptions, metagene & enrichment")
             build_page_gene_context(pdf, merged, pos_df, args.gff)
