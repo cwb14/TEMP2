@@ -1616,7 +1616,7 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None, crm_intervals=Non
                 vmin=0, vmax=1,
                 zorder=2,
                 origin="lower",
-                alpha=0.85,
+                alpha=0.45,
             )
 
         if clusters_df.empty:
@@ -2330,6 +2330,553 @@ def build_page4(pdf, merged):
     plt.close(fig)
 
 
+def build_sample_presence_matrix(pos_df, window=5):
+    """
+    Cluster all insertions (all samples combined) within ±window bp using a
+    sweep-line merge, then return a binary sample×cluster presence/absence
+    DataFrame (int8).  Each column is one genomic locus (cluster).
+    """
+    if pos_df.empty:
+        return pd.DataFrame()
+
+    samples = sorted(pos_df["sample_id"].unique())
+    sample_idx = {s: i for i, s in enumerate(samples)}
+    clusters = []          # list of frozensets of sample IDs
+
+    for chrom, grp in pos_df.groupby("Chr"):
+        rows = sorted(
+            zip(grp["Start"].astype(int), grp["End"].astype(int),
+                grp["sample_id"]),
+            key=lambda x: x[0],
+        )
+        if not rows:
+            continue
+
+        cs, ce = rows[0][0] - window, rows[0][1] + window
+        csids = {rows[0][2]}
+
+        for start, end, sid in rows[1:]:
+            es, ee = start - window, end + window
+            if es <= ce:
+                ce = max(ce, ee)
+                csids.add(sid)
+            else:
+                clusters.append(frozenset(csids))
+                cs, ce, csids = es, ee, {sid}
+        clusters.append(frozenset(csids))
+
+    if not clusters:
+        return pd.DataFrame()
+
+    mat = np.zeros((len(samples), len(clusters)), dtype=np.int8)
+    for j, cl in enumerate(clusters):
+        for s in cl:
+            if s in sample_idx:
+                mat[sample_idx[s], j] = 1
+
+    return pd.DataFrame(mat, index=samples)
+
+
+def build_page_sample_sharing(pdf, pos_df, gly_map, merged=None):
+    """
+    New page: sample TE insertion sharing.
+
+    Left  panel → PCoA (metric MDS on Jaccard distances) coloured by Region;
+                  marker edge colour encodes R/S phenotype.
+    Right panel → pairwise Jaccard similarity heatmap hierarchically ordered
+                  (UPGMA) with a top dendrogram whose branches are coloured by
+                  Region (grey where multiple regions merge).
+    """
+    from scipy.spatial.distance import pdist, squareform
+    from scipy.cluster.hierarchy import linkage, leaves_list, dendrogram
+    import matplotlib.patches as mpatches
+    import matplotlib.colors as mcolors
+
+    mat = build_sample_presence_matrix(pos_df)
+    if mat.empty or mat.shape[0] < 3:
+        return
+
+    samples = list(mat.index)
+    n = len(samples)
+
+    # ── Jaccard distances ──────────────────────────────────────────────────────
+    X = mat.values.astype(float)
+    dist_vec = pdist(X, metric="jaccard")
+    dist_sq  = squareform(dist_vec)
+    np.fill_diagonal(dist_sq, 0.0)
+    sim_sq = 1.0 - dist_sq
+
+    # ── UPGMA hierarchical clustering ─────────────────────────────────────────
+    Z     = linkage(dist_vec, method="average")
+    order = leaves_list(Z)
+    ordered_samples = [samples[i] for i in order]
+    sim_ordered     = sim_sq[np.ix_(order, order)]
+
+    # ── PCoA via metric MDS ───────────────────────────────────────────────────
+    try:
+        from sklearn.manifold import MDS
+        try:
+            mds = MDS(n_components=2, dissimilarity="precomputed",
+                      random_state=42, normalized_stress="auto")
+        except TypeError:
+            mds = MDS(n_components=2, dissimilarity="precomputed",
+                      random_state=42)
+        coords = mds.fit_transform(dist_sq)
+        stress = mds.stress_
+        pcoa_ok = True
+    except ImportError:
+        pcoa_ok = False
+
+    # ── Region map & palette ──────────────────────────────────────────────────
+    region_map = {}
+    if merged is not None:
+        for col in ["Region_new", "Region", "region"]:
+            if col in merged.columns:
+                for sid in samples:
+                    if sid in merged.index:
+                        v = merged.loc[sid, col]
+                        if pd.notna(v) and str(v).lower() not in ("nan", ""):
+                            region_map[sid] = str(v)
+                break
+
+    unique_regions = sorted(set(region_map.values()))
+    n_reg = len(unique_regions)
+    base_cmap = plt.cm.get_cmap("tab10" if n_reg <= 10 else "tab20")
+    region_palette = {
+        r: mcolors.to_hex(base_cmap(i % base_cmap.N))
+        for i, r in enumerate(unique_regions)
+    }
+    MIXED_COL = "#888888"
+
+    def rcol(sid):
+        """Region colour for a sample; grey if unknown."""
+        return region_palette.get(region_map.get(sid), MIXED_COL)
+
+    # ── Dendrogram link_color_func (colour by region) ─────────────────────────
+    # cluster_region_set[k] = set of region labels for all leaves under node k.
+    # Leaves are indices 0..n-1; internal nodes n..2n-2.
+    # link_color_func(k) colours the link FROM node k TO its parent.
+    cluster_region_set = {}
+    for i, s in enumerate(samples):
+        r = region_map.get(s)
+        cluster_region_set[i] = {r} if r is not None else {None}
+    for i, row in enumerate(Z):
+        left, right = int(row[0]), int(row[1])
+        cluster_region_set[n + i] = (cluster_region_set[left] |
+                                     cluster_region_set[right])
+
+    def link_color_func(k):
+        regs = cluster_region_set.get(k, {None}) - {None}
+        if len(regs) == 1:
+            return region_palette.get(next(iter(regs)), MIXED_COL)
+        return MIXED_COL
+
+    # ── Phenotype edge colours for PCoA ───────────────────────────────────────
+    R_COL, S_COL = "#c0392b", "#2980b9"
+
+    def pheno_edge(sid):
+        v = gly_map.get(sid)
+        return R_COL if v is True else S_COL if v is False else "white"
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(11, 8.5))
+
+    # Reserve bottom margin for the region legend (~2 rows of 17 entries)
+    LEG_BOTTOM = 0.17
+    if pcoa_ok:
+        outer = gridspec.GridSpec(
+            1, 2, figure=fig,
+            left=0.06, right=0.97, top=0.97, bottom=LEG_BOTTOM,
+            wspace=0.32, width_ratios=[2, 3],
+        )
+        ax_pcoa = fig.add_subplot(outer[0, 0])
+        heat_ss = outer[0, 1]
+    else:
+        outer = gridspec.GridSpec(
+            1, 1, figure=fig,
+            left=0.10, right=0.92, top=0.97, bottom=LEG_BOTTOM,
+        )
+        heat_ss = outer[0, 0]
+
+    inner = gridspec.GridSpecFromSubplotSpec(
+        2, 2, subplot_spec=heat_ss,
+        height_ratios=[0.18, 0.82],
+        width_ratios=[0.91, 0.04],
+        hspace=0.01, wspace=0.04,
+    )
+    ax_dend = fig.add_subplot(inner[0, 0])
+    ax_heat = fig.add_subplot(inner[1, 0])
+    ax_cbar = fig.add_subplot(inner[1, 1])
+
+    # ── PCoA panel ────────────────────────────────────────────────────────────
+    if pcoa_ok:
+        pt_face   = [rcol(s) for s in samples]
+        pt_edge   = [pheno_edge(s) for s in samples]
+        ax_pcoa.scatter(
+            coords[:, 0], coords[:, 1],
+            c=pt_face, edgecolors=pt_edge, linewidths=1.2,
+            s=60, zorder=3, alpha=0.92,
+        )
+        lbl_fs = max(4, min(7, 100 // n))
+        for i, sid in enumerate(samples):
+            ax_pcoa.annotate(
+                str(sid), (coords[i, 0], coords[i, 1]),
+                textcoords="offset points", xytext=(0, 4),
+                fontsize=lbl_fs, ha="center", va="bottom", alpha=0.75,
+            )
+        ax_pcoa.axhline(0, color="#ddd", lw=0.5, zorder=1)
+        ax_pcoa.axvline(0, color="#ddd", lw=0.5, zorder=1)
+        ax_pcoa.set_xlabel("PCoA 1", fontsize=9)
+        ax_pcoa.set_ylabel("PCoA 2", fontsize=9)
+        ax_pcoa.set_title(
+            f"PCoA  (Jaccard · metric MDS · stress={stress:.3f})",
+            fontsize=8.5,
+        )
+        ax_pcoa.tick_params(labelsize=7)
+
+    # ── Dendrogram – drawn manually so each leg gets its own colour ───────────
+    # scipy's link_color_func(k) colours the *entire* U-shape (both legs AND
+    # the bar) with the colour of the merged node k.  That means when a red
+    # sample and a blue sample fork, the leg going down to the red sample also
+    # turns grey.  Fix: compute x/y positions ourselves (same midpoint layout
+    # scipy uses) then draw each left-leg, bar, and right-leg as separate
+    # Line2D objects with independent colours.
+    LEAF_SCALE = 10
+    _leaf_order = list(leaves_list(Z))        # leaf display order (left → right)
+    _cx: dict = {}                            # cluster → x centre
+    _cy: dict = {}                            # cluster → y (merge height)
+    for _di, _si in enumerate(_leaf_order):
+        _cx[_si] = LEAF_SCALE * _di + LEAF_SCALE / 2
+        _cy[_si] = 0.0
+
+    def _lcol(k):
+        """Colour for the link/leg leading UP from cluster k."""
+        if not region_map:
+            return MIXED_COL
+        regs = cluster_region_set.get(k, {None}) - {None}
+        if len(regs) == 1:
+            return region_palette.get(next(iter(regs)), MIXED_COL)
+        return MIXED_COL
+
+    LW = 1.5
+    for _i, _row in enumerate(Z):
+        _left, _right = int(_row[0]), int(_row[1])
+        _h   = float(_row[2])
+        _node = n + _i
+        _xl, _xr = _cx[_left], _cx[_right]
+        _yl, _yr = _cy[_left], _cy[_right]
+        _cx[_node] = (_xl + _xr) / 2
+        _cy[_node] = _h
+        # left leg: child → merge height  (coloured by the child's region)
+        ax_dend.plot([_xl, _xl], [_yl, _h], color=_lcol(_left),  lw=LW,
+                     solid_capstyle="butt")
+        # horizontal bar: left → right at merge height (grey when regions mix)
+        ax_dend.plot([_xl, _xr], [_h,  _h], color=_lcol(_node),  lw=LW,
+                     solid_capstyle="butt")
+        # right leg
+        ax_dend.plot([_xr, _xr], [_yr, _h], color=_lcol(_right), lw=LW,
+                     solid_capstyle="butt")
+
+    ax_dend.set_xlim(0, n * LEAF_SCALE)
+    ax_dend.set_ylim(0, float(Z[:, 2].max()) * 1.1)
+    ax_dend.axis("off")
+
+    # ── Heatmap (log-normalised) ───────────────────────────────────────────────
+    from matplotlib.colors import LogNorm
+    off_diag = sim_ordered[~np.eye(n, dtype=bool)]
+    nonzero  = off_diag[off_diag > 0]
+    vmin_log = float(nonzero.min()) if len(nonzero) else 1e-4
+    vmin_log = max(vmin_log, 1e-4)          # floor to avoid extreme log range
+    sim_display = np.clip(sim_ordered, vmin_log, 1.0)
+    np.fill_diagonal(sim_display, 1.0)      # self-similarity stays at 1
+
+    extent = [0, n * LEAF_SCALE, 0, n]
+    im = ax_heat.imshow(
+        sim_display, extent=extent, aspect="auto",
+        cmap="YlOrRd", norm=LogNorm(vmin=vmin_log, vmax=1.0),
+        interpolation="nearest", origin="upper",
+    )
+    ax_heat.set_xlim(0, n * LEAF_SCALE)
+    ax_heat.set_ylim(0, n)
+
+    tick_fs = max(4, min(7, 120 // n))
+    x_ticks = [LEAF_SCALE * i + LEAF_SCALE / 2 for i in range(n)]
+    y_ticks = [n - i - 0.5 for i in range(n)]
+    ax_heat.set_xticks(x_ticks)
+    ax_heat.set_xticklabels(ordered_samples, rotation=90, fontsize=tick_fs)
+    ax_heat.set_yticks(y_ticks)
+    ax_heat.set_yticklabels(ordered_samples, fontsize=tick_fs)
+
+    # Colour tick labels by glyphosate status (R=red, S=blue, unknown=grey)
+    R_COL, S_COL, U_COL = "#c0392b", "#2980b9", "#95a5a6"
+    def gcol(sid):
+        v = gly_map.get(sid)
+        return R_COL if v is True else S_COL if v is False else U_COL
+
+    fig.canvas.draw()
+    for lbl in ax_heat.get_xticklabels():
+        lbl.set_color(gcol(lbl.get_text()))
+    for lbl in ax_heat.get_yticklabels():
+        lbl.set_color(gcol(lbl.get_text()))
+
+    # ── Colorbar ──────────────────────────────────────────────────────────────
+    cbar = fig.colorbar(im, cax=ax_cbar)
+    cbar.set_label("Jaccard\nsimilarity\n(log scale)", fontsize=7,
+                   rotation=270, labelpad=14)
+    cbar.ax.tick_params(labelsize=6)
+
+    # ── Region legend (always shown on dendrogram axes) ───────────────────────
+    if region_map and unique_regions:
+        leg_patches = [mpatches.Patch(color=region_palette[r], label=r)
+                       for r in unique_regions]
+        if pcoa_ok:
+            # R/S edge indicators only meaningful when PCoA dots are visible
+            R_COL, S_COL = "#c0392b", "#2980b9"
+            if any(gly_map.get(s) is True  for s in samples):
+                leg_patches.append(Line2D([0], [0], marker="o", color="w",
+                                          markerfacecolor="w",
+                                          markeredgecolor=R_COL,
+                                          markeredgewidth=1.5, markersize=6,
+                                          label="Resistant (dot edge)"))
+            if any(gly_map.get(s) is False for s in samples):
+                leg_patches.append(Line2D([0], [0], marker="o", color="w",
+                                          markerfacecolor="w",
+                                          markeredgecolor=S_COL,
+                                          markeredgewidth=1.5, markersize=6,
+                                          label="Susceptible (dot edge)"))
+        # ncol: aim for ~2 rows
+        ncols = max(1, -(-len(leg_patches) // 2))   # ceiling division → 2 rows
+        fig.legend(
+            handles=leg_patches,
+            fontsize=6.5, loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=ncols,
+            framealpha=0.85,
+            title="Region",
+            title_fontsize=7,
+        )
+
+    # ── Subtitle ──────────────────────────────────────────────────────────────
+    n_loci = mat.shape[1]
+    pcoa_note = "  ·  PCoA dot edge = R (red) / S (blue)" if pcoa_ok else ""
+    fig.text(
+        0.5, LEG_BOTTOM - 0.01,
+        f"{n} samples  ·  {n_loci:,} insertion loci (±5 bp merge window)"
+        f"  ·  heatmap log-normalised"
+        f"  ·  sample label colour = Resistant (red) / Susceptible (blue){pcoa_note}",
+        ha="center", va="top", fontsize=6.5, color="#555",
+    )
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_page_kary_sharing(pdf, clusters_df, pos_df,
+                            fai_lengths, crm_intervals,
+                            gly_map, merged=None):
+    """
+    Combined page: Panel A (top) = karyotype enrichment,
+                   Panel B (bottom) = UPGMA dendrogram + Jaccard heatmap.
+    """
+    from scipy.spatial.distance import pdist, squareform
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    from matplotlib.colors import LogNorm
+    import matplotlib.patches as mpatches
+    import matplotlib.colors as mcolors
+
+    # ── Sample sharing data ───────────────────────────────────────────────────
+    mat = build_sample_presence_matrix(pos_df)
+    has_sharing = not mat.empty and mat.shape[0] >= 3
+
+    LEG_BOTTOM = 0.11
+    fig = plt.figure(figsize=(11, 16))
+
+    outer = gridspec.GridSpec(
+        2, 1, figure=fig,
+        left=0.06, right=0.95, top=0.97, bottom=LEG_BOTTOM,
+        hspace=0.10, height_ratios=[0.40, 0.60],
+    )
+
+    # ── Panel A: karyotype ────────────────────────────────────────────────────
+    ax_kary = fig.add_subplot(outer[0, 0])
+    panel_karyotype(ax_kary, clusters_df, pos_df,
+                    fai_lengths=fai_lengths, crm_intervals=crm_intervals)
+    ax_kary.text(-0.005, 1.02, "A", transform=ax_kary.transAxes,
+                 fontsize=13, fontweight="bold", va="bottom")
+
+    # ── Panel B: dendrogram + heatmap ─────────────────────────────────────────
+    if not has_sharing:
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    samples = list(mat.index)
+    n = len(samples)
+
+    X        = mat.values.astype(float)
+    dist_vec = pdist(X, metric="jaccard")
+    dist_sq  = squareform(dist_vec)
+    np.fill_diagonal(dist_sq, 0.0)
+    sim_sq   = 1.0 - dist_sq
+
+    Z               = linkage(dist_vec, method="average")
+    order           = leaves_list(Z)
+    ordered_samples = [samples[i] for i in order]
+    sim_ordered     = sim_sq[np.ix_(order, order)]
+
+    # Region palette
+    region_map = {}
+    if merged is not None:
+        for col in ["Region_new", "Region", "region"]:
+            if col in merged.columns:
+                for sid in samples:
+                    if sid in merged.index:
+                        v = merged.loc[sid, col]
+                        if pd.notna(v) and str(v).lower() not in ("nan", ""):
+                            region_map[sid] = str(v)
+                break
+
+    unique_regions = sorted(set(region_map.values()))
+    n_reg = len(unique_regions)
+    base_cmap = plt.cm.get_cmap("tab10" if n_reg <= 10 else "tab20")
+    region_palette = {
+        r: mcolors.to_hex(base_cmap(i % base_cmap.N))
+        for i, r in enumerate(unique_regions)
+    }
+    MIXED_COL = "#888888"
+
+    def rcol(sid):
+        return region_palette.get(region_map.get(sid), MIXED_COL)
+
+    # cluster_region_set for branch coloring
+    cluster_region_set = {}
+    for i, s in enumerate(samples):
+        r = region_map.get(s)
+        cluster_region_set[i] = {r} if r is not None else {None}
+    for i, row in enumerate(Z):
+        left, right = int(row[0]), int(row[1])
+        cluster_region_set[n + i] = (cluster_region_set[left] |
+                                     cluster_region_set[right])
+
+    def _lcol(k):
+        if not region_map:
+            return MIXED_COL
+        regs = cluster_region_set.get(k, {None}) - {None}
+        if len(regs) == 1:
+            return region_palette.get(next(iter(regs)), MIXED_COL)
+        return MIXED_COL
+
+    # Glyphosate colours for tick labels
+    R_COL, S_COL, U_COL = "#c0392b", "#2980b9", "#95a5a6"
+    def gcol(sid):
+        v = gly_map.get(sid)
+        return R_COL if v is True else S_COL if v is False else U_COL
+
+    # Sub-grid for panel B
+    inner = gridspec.GridSpecFromSubplotSpec(
+        2, 2, subplot_spec=outer[1, 0],
+        height_ratios=[0.15, 0.85], width_ratios=[0.92, 0.04],
+        hspace=0.01, wspace=0.04,
+    )
+    ax_dend = fig.add_subplot(inner[0, 0])
+    ax_heat = fig.add_subplot(inner[1, 0])
+    ax_cbar = fig.add_subplot(inner[1, 1])
+
+    ax_dend.text(-0.005, 1.10, "B", transform=ax_dend.transAxes,
+                 fontsize=13, fontweight="bold", va="bottom")
+
+    # Dendrogram (manual per-leg coloring)
+    LEAF_SCALE = 10
+    _leaf_order = list(leaves_list(Z))
+    _cx: dict = {}
+    _cy: dict = {}
+    for _di, _si in enumerate(_leaf_order):
+        _cx[_si] = LEAF_SCALE * _di + LEAF_SCALE / 2
+        _cy[_si] = 0.0
+
+    LW = 1.5
+    for _i, _row in enumerate(Z):
+        _left, _right = int(_row[0]), int(_row[1])
+        _h    = float(_row[2])
+        _node = n + _i
+        _xl, _xr = _cx[_left], _cx[_right]
+        _yl, _yr = _cy[_left], _cy[_right]
+        _cx[_node] = (_xl + _xr) / 2
+        _cy[_node] = _h
+        ax_dend.plot([_xl, _xl], [_yl, _h], color=_lcol(_left),  lw=LW,
+                     solid_capstyle="butt")
+        ax_dend.plot([_xl, _xr], [_h,  _h], color=_lcol(_node),  lw=LW,
+                     solid_capstyle="butt")
+        ax_dend.plot([_xr, _xr], [_yr, _h], color=_lcol(_right), lw=LW,
+                     solid_capstyle="butt")
+
+    ax_dend.set_xlim(0, n * LEAF_SCALE)
+    ax_dend.set_ylim(0, float(Z[:, 2].max()) * 1.1)
+    ax_dend.axis("off")
+
+    # Heatmap (log-normalised)
+    off_diag = sim_ordered[~np.eye(n, dtype=bool)]
+    nonzero  = off_diag[off_diag > 0]
+    vmin_log = float(nonzero.min()) if len(nonzero) else 1e-4
+    vmin_log = max(vmin_log, 1e-4)
+    sim_display = np.clip(sim_ordered, vmin_log, 1.0)
+    np.fill_diagonal(sim_display, 1.0)
+
+    extent = [0, n * LEAF_SCALE, 0, n]
+    im = ax_heat.imshow(
+        sim_display, extent=extent, aspect="auto",
+        cmap="YlOrRd", norm=LogNorm(vmin=vmin_log, vmax=1.0),
+        interpolation="nearest", origin="upper",
+    )
+    ax_heat.set_xlim(0, n * LEAF_SCALE)
+    ax_heat.set_ylim(0, n)
+
+    tick_fs = max(4, min(7, 120 // n))
+    x_ticks = [LEAF_SCALE * i + LEAF_SCALE / 2 for i in range(n)]
+    y_ticks = [n - i - 0.5 for i in range(n)]
+    ax_heat.set_xticks(x_ticks)
+    ax_heat.set_xticklabels(ordered_samples, rotation=90, fontsize=tick_fs)
+    ax_heat.set_yticks(y_ticks)
+    ax_heat.set_yticklabels(ordered_samples, fontsize=tick_fs)
+
+    fig.canvas.draw()
+    for lbl in ax_heat.get_xticklabels():
+        lbl.set_color(gcol(lbl.get_text()))
+    for lbl in ax_heat.get_yticklabels():
+        lbl.set_color(gcol(lbl.get_text()))
+
+    cbar = fig.colorbar(im, cax=ax_cbar)
+    cbar.set_label("Jaccard\nsimilarity\n(log scale)", fontsize=7,
+                   rotation=270, labelpad=14)
+    cbar.ax.tick_params(labelsize=6)
+
+    # Region legend at bottom
+    if region_map and unique_regions:
+        leg_patches = [mpatches.Patch(color=region_palette[r], label=r)
+                       for r in unique_regions]
+        ncols = max(1, -(-len(leg_patches) // 2))
+        fig.legend(
+            handles=leg_patches,
+            fontsize=6.5, loc="lower center",
+            bbox_to_anchor=(0.5, 0.045),
+            ncol=ncols, framealpha=0.85,
+            title="Region", title_fontsize=7,
+        )
+
+    n_loci = mat.shape[1]
+    fig.text(
+        0.5, LEG_BOTTOM - 0.005,
+        f"{n} samples  ·  {n_loci:,} insertion loci (±5 bp merge window)"
+        f"  ·  heatmap log-normalised"
+        f"  ·  branch/label colour = Region"
+        f"  ·  sample label colour = Resistant (red) / Susceptible (blue)",
+        ha="center", va="top", fontsize=6.5, color="#555",
+    )
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
 def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     """Page 6: linear karyotype with R/S-enriched insertion positions."""
     fig = plt.figure(figsize=(11, 8.5))
@@ -2700,9 +3247,11 @@ def main():
         build_page3(pdf, merged)
         print("    Page 4: per-sample stacked bars (superfamily + family, side-by-side)")
         build_page4(pdf, merged)
-        print("    Page 5: karyotype enrichment plot")
-        build_page6(pdf, clusters_df, pos_df, fai_lengths=fai_lengths,
-                    crm_intervals=crm_intervals)
+        print("    Page 5: karyotype (A) + sample TE sharing heatmap (B)")
+        build_page_kary_sharing(pdf, clusters_df, pos_df,
+                                fai_lengths=fai_lengths,
+                                crm_intervals=crm_intervals,
+                                gly_map=gly_map, merged=merged)
         if args.gff:
             print("    Page 6: gene-context disruptions, metagene & enrichment")
             build_page_gene_context(pdf, merged, pos_df, args.gff)
