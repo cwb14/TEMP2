@@ -7,8 +7,8 @@ Five-page multi-panel PDF from TEMP2 TE insertion BED files + master TSV.
   Page 1  TE composition & group comparisons      (panels A–D)
   Page 2  Regression analyses                      (panels A–C: Bio25, Bio30, CWD)
   Page 3  Glyphosate violin plots & BioClim corr  (2 rows)
-  Page 4  Per-sample stacked bar by family         (full width)
-  Page 5  Per-sample stacked bar by LTR-RT clade  (full width)
+  Page 4  Per-sample stacked bar by superfamily    (full width)
+  Page 5  Per-sample stacked bar by LTR-RT family (full width)
 
 Recommended command for marestail dataset:
     conda run -n bioinfo python te_figures.py \\
@@ -86,7 +86,7 @@ PALETTE = [
     "#E377C2", "#BCBD22", "#17BECF", "#AEC6CF", "#FFB347",
 ]
 
-# Per-category palettes — no shared colors between family and clade sets.
+# Per-category palettes — no shared colors between superfamily and family sets.
 #
 # FAM_PALETTE  (10): ColorBrewer Set1 — bold, highly saturated primaries.
 # CLADE_PALETTE(24): ColorBrewer Paired(12) + Pastel2(8) + 4 extras —
@@ -303,10 +303,10 @@ def load_te_bed(filepath, awk_filter=None):
 
 def parse_te_levels(te_id):
     """
-    Parse TE_ID field.  Returns list of level tuples (order, family, clade) where:
-      order  = parts[0]  (LTR, DNA, LINE …)                top-level order
-      family = parts[1]  (Copia, Gypsy, hAT, Helitron …)  superfamily level
-      clade  = parts[-1] (SIRE, TAR, Ale, Helitron, DTH …) most specific level
+    Parse TE_ID field.  Returns list of level tuples (order, superfamily, family) where:
+      order       = parts[0]  (LTR, DNA, LINE …)                top-level order
+      superfamily = parts[1]  (Copia, Gypsy, hAT, Helitron …)  superfamily level
+      family      = parts[-1] (SIRE, TAR, Ale, Helitron, DTH …) family level
     """
     if not isinstance(te_id, str):
         return []
@@ -667,13 +667,13 @@ def compute_metagene_profile(pos_df, genes_df, window=2000, bin_size=50,
 
 def compute_context_te_composition(pos_df, genes_df, exon_intervals,
                                    window=GENE_CONTEXT_WINDOW_BP):
-    """Classify each TE insertion into gene context and tabulate by family/clade.
+    """Classify each TE insertion into gene context and tabulate by superfamily/family.
 
     Priority: Exonic > Intronic > Upstream 2 kb > Downstream 2 kb.
     Insertions that fall in none of these windows are discarded (intergenic).
 
     Returns (fam_df, clade_df) — count DataFrames with
-      rows = contexts, columns = family or clade names.
+      rows = contexts, columns = superfamily or family names.
     """
     CONTEXTS = CONTEXT_ORDER
     fam_counts   = {ctx: Counter() for ctx in CONTEXTS}
@@ -765,7 +765,7 @@ def compute_context_te_composition(pos_df, genes_df, exon_intervals,
                     elif dn:
                         context_arr[c0 + i] = 3
 
-        # Accumulate family/clade counts per context (aggregate + per-sample)
+        # Accumulate superfamily/family counts per context (aggregate + per-sample)
         for i in range(n_te):
             ctx_idx = int(context_arr[i])
             if ctx_idx < 0:
@@ -782,7 +782,7 @@ def compute_context_te_composition(pos_df, genes_df, exon_intervals,
                     key_c = (sid, ctx_name, clade)
                     sample_clade_counts[key_c] = sample_clade_counts.get(key_c, 0) + 1
 
-    # Build output DataFrames (rows=contexts, cols=family/clade)
+    # Build output DataFrames (rows=contexts, cols=superfamily/family)
     all_fams   = sorted({f for c in fam_counts.values()   for f in c}) or ["Unknown"]
     all_clades = sorted({c for cc in clade_counts.values() for c in cc}) or ["Unknown"]
 
@@ -813,7 +813,7 @@ def compute_context_te_composition(pos_df, genes_df, exon_intervals,
 def describe_cluster_tes(chrom, pos, pos_df, window=50):
     """
     Find all BED rows within ±window bp of pos on chrom and summarise
-    the TE identities (order/superfamily/clade) present in the cluster.
+    the TE identities (order/superfamily/family) present in the cluster.
     Returns a list of strings, one per unique TE type, sorted by count desc.
     """
     if pos_df.empty or "TE_ID" not in pos_df.columns:
@@ -1061,7 +1061,7 @@ def panel_bar(ax, merged, col_prefix, title, panel_letter, top_n=12):
 #    cols = [c for c in merged.columns if c.startswith(col_prefix)
 #            and c != col_prefix + "mixture"]
     cols = get_te_cols(merged, col_prefix)
-    y_label = "LTR-RT Clade" if "clade" in col_prefix else "TE Family"
+    y_label = "LTR-RT Family" if "clade" in col_prefix else "TE Superfamily"
     if not cols:
         ax.text(0.5, 0.5, f"No {col_prefix} data", ha="center",
                 transform=ax.transAxes)
@@ -1221,7 +1221,7 @@ def panel_regression(ax, x, y, xlabel, ylabel, panel_letter, var_desc=None):
 def panel_gly_violin(ax, merged, gly_col, col_prefix, title, panel_letter,
                      top_n=10, y_transform="log10p1"):
     """
-    Grouped violin + box overlay + jitter per TE family/clade,
+    Grouped violin + box overlay + jitter per TE superfamily/family,
     split by Glyphosate resistance (Susceptible vs Resistant).
     Pairs are plotted side-by-side for easy comparison.
     Mann-Whitney U significance shown above each pair.
@@ -1338,7 +1338,7 @@ def panel_gly_violin(ax, merged, gly_col, col_prefix, title, panel_letter,
                     ha="center", va="bottom", fontsize=8,
                     color="#333", fontweight="bold")
 
-    x_label = "LTR-RT Clade" if "clade" in col_prefix else "TE Family"
+    x_label = "LTR-RT Family" if "clade" in col_prefix else "TE Superfamily"
     cat_labels = [fc.replace(col_prefix, "") for fc in top_cols]
     ax.set_xticks(np.arange(n_cats))
     ax.set_xticklabels(cat_labels, fontsize=7.5, rotation=30, ha="right")
@@ -1524,7 +1524,7 @@ def panel_sample_stacked(ax, merged, col_prefix="te_fam_", top_n=10,
     ax.tick_params(axis="y", left=False, labelleft=False)
     ax.set_ylabel("Sample")
 
-    group_name = "Family" if "fam" in col_prefix else "Clade"
+    group_name = "Superfamily" if "fam" in col_prefix else "Family"
     te_label   = "LTR-RT" if "clade" in col_prefix else "TE"
     ax.set_xlabel(f"Total {te_label} Insertions")
     if panel_letter:
@@ -1690,7 +1690,7 @@ def panel_karyotype(ax, clusters_df, pos_df, fai_lengths=None, crm_intervals=Non
                label=f"Shared / not significant  (n={n_shr})"),
         Line2D([0], [0], color="#FF8C00", lw=1.4,
                marker="v", markersize=6, markerfacecolor="#FF8C00",
-               label="Known resistance variant (NC_057763.1:38,804,274)"),
+               label="Known R-variant (NC_057763.1:38,804,274)"),
     ]
     if crm_intervals:
         n_crm = sum(len(v) for v in crm_intervals.values())
@@ -1783,10 +1783,10 @@ def panel_gene_disruption(ax, disruption_df, merged, n_genes=1,
 
 def panel_context_bar(ax, comp_df, palette, panel_letter, top_n=10, label=None):
 
-    """Stacked proportional horizontal bar chart: gene-context × TE family/clade.
+    """Stacked proportional horizontal bar chart: gene-context × TE superfamily/family.
 
     comp_df rows = contexts (Exonic, Intronic, Upstream 2kb, Downstream 2kb).
-    comp_df cols = family or clade names.
+    comp_df cols = superfamily or family names.
     """
     CONTEXTS = [c for c in CONTEXT_ORDER if c in comp_df.index]
     present  = [c for c in CONTEXTS if c in comp_df.index]
@@ -1939,7 +1939,7 @@ def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
     """Grouped violin plot of per-sample context *proportions* per category.
 
     For each sample × category, the raw counts are normalised to proportions
-    (sum-to-1 within that sample–category pair), so every family/clade gets
+    (sum-to-1 within that sample–category pair), so every superfamily/family gets
     equal visual weight regardless of abundance.
 
     long_df columns: [sample_id, context, category, count].
@@ -2188,7 +2188,7 @@ def _canonical_region_order(merged, reg_col="Region_new"):
 # ── Page builders ────────────────────────────────────────────────────────────
 
 def build_page1(pdf, merged):
-    """Page 1: clade bar, family bar, region boxplot, gly boxplot."""
+    """Page 1: family bar, superfamily bar, region boxplot, gly boxplot."""
     fig = plt.figure(figsize=(11, 8.5))
     gs  = gridspec.GridSpec(2, 2, figure=fig,
                             hspace=0.35, wspace=0.42, # EDIT 0.40 to shift. Was 0.52
@@ -2196,10 +2196,10 @@ def build_page1(pdf, merged):
                             top=0.97, bottom=0.08)
 
     panel_bar(fig.add_subplot(gs[0, 0]), merged,
-              "te_fam_", "Mean TE Insertions by Family", "A",
+              "te_fam_", "Mean TE Insertions by Superfamily", "A",
               top_n=None)
     panel_bar(fig.add_subplot(gs[0, 1]), merged,
-              "te_clade_", "Mean LTR-RT Insertions by Clade", "B",
+              "te_clade_", "Mean LTR-RT Insertions by Family", "B",
               top_n=None)
     panel_boxplot(fig.add_subplot(gs[1, 0]), merged, "Region_new",
                   "Total TE Insertions by Region", "C",
@@ -2265,7 +2265,7 @@ def build_page2(pdf, merged):
 def build_page3(pdf, merged):
     """
     Page 3:
-      Row 0: [Gly × Family stacked]  [Gly × Clade stacked]
+      Row 0: [Gly × Superfamily stacked]  [Gly × Family stacked]
       Row 1: [BioClim correlation bar + key — full width]
     """
     fig = plt.figure(figsize=(11, 11))
@@ -2284,12 +2284,12 @@ def build_page3(pdf, merged):
 
     panel_gly_violin(fig.add_subplot(row0[0, 0]), merged, gly_col,
                      "te_fam_",
-                     "TE Family Insertions by Glyphosate Resistance", "A",
+                     "TE Superfamily Insertions by Glyphosate Resistance", "A",
                      y_transform="log10p1")
 
     panel_gly_violin(fig.add_subplot(row0[0, 1]), merged, gly_col,
                      "te_clade_",
-                     "LTR-RT Clade Insertions by Glyphosate Resistance", "B",
+                     "LTR-RT Family Insertions by Glyphosate Resistance", "B",
                      y_transform="log10p1")
                                       
     # Row 1: BioClim bar + key
@@ -2307,7 +2307,7 @@ def build_page3(pdf, merged):
 
 def build_page4(pdf, merged):
     """
-    Page 4: per-sample stacked bars — family (left) and LTR-RT clade (right)
+    Page 4: per-sample stacked bars — superfamily (left) and LTR-RT family (right)
     side-by-side on a single page.  No Y-axis labels; pink bands = resistant.
     """
     n = len(merged)
@@ -2342,7 +2342,7 @@ def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
 
 
 def build_page_gene_context(pdf, merged, pos_df, gff_path):
-    """Page 6: panels A (disruption), B (metagene), C (TE family), D (clade)."""
+    """Page 6: panels A (disruption), B (metagene), C (TE superfamily), D (family)."""
     print("    Loading GFF for gene-context page …")
     genes_df, exon_intervals = load_gff_full(gff_path)
     if genes_df.empty:
@@ -2392,7 +2392,7 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
         plot_regions = reg_order or []
     n_regions = max(len(plot_regions), 1)
 
-    # ── Single page: A (disruption), B (fam violin+heatmap), C (clade
+    # ── Single page: A (disruption), B (superfam violin+heatmap), C (fam
     #    violin+heatmap) on left; D (metagene strips) on right ────────────
     fig_h = max(11.0, n_regions * 0.65 + 5.0)
     fig = plt.figure(figsize=(11, fig_h))
@@ -2414,7 +2414,7 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
                           n_genes=n_genes, panel_letter="A",
                           region_order=reg_order)
 
-    # Panel B: TE family — proportion violin (top) + enrichment heatmap (bottom)
+    # Panel B: TE superfamily — proportion violin (top) + enrichment heatmap (bottom)
     # Tight internal spacing (hspace) so they read as one unit
     B_gs = gridspec.GridSpecFromSubplotSpec(
         2, 1, subplot_spec=left_gs[1, 0],
@@ -2436,7 +2436,7 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
                               top_cats_override=top_fams,
                               context_lengths_kb=ctx_lengths_kb)
     panel_context_enrichment(ax_B_heat, fam_comp_df,
-                             panel_letter=None, top_n=10, label="TE Family",
+                             panel_letter=None, top_n=10, label="TE Superfamily",
                              show_xticklabels=True,
                              top_cats_override=top_fams,
                              context_lengths_kb=ctx_lengths_kb)
@@ -2444,7 +2444,7 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
     ax_B_violin.set_xlim(-0.5, n_fams - 0.5)
     ax_B_heat.set_xlim(-0.5, n_fams - 0.5)
 
-    # Panel C: LTR-RT clade — proportion violin (top) + enrichment heatmap (bottom)
+    # Panel C: LTR-RT family — proportion violin (top) + enrichment heatmap (bottom)
     C_gs = gridspec.GridSpecFromSubplotSpec(
         2, 1, subplot_spec=left_gs[2, 0],
         hspace=0.05,
@@ -2461,7 +2461,7 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
                               top_cats_override=top_clades,
                               context_lengths_kb=ctx_lengths_kb)
     panel_context_enrichment(ax_C_heat, clade_comp_df,
-                             panel_letter=None, top_n=12, label="LTR-RT Clade",
+                             panel_letter=None, top_n=12, label="LTR-RT Family",
                              show_xticklabels=True,
                              top_cats_override=top_clades,
                              context_lengths_kb=ctx_lengths_kb)
@@ -2566,7 +2566,7 @@ def main():
 
     n_clade = sum(1 for c in merged.columns if c.startswith("te_clade_"))
     n_fam   = sum(1 for c in merged.columns if c.startswith("te_fam_"))
-    print(f"    te_clade_* cols: {n_clade}  te_fam_* cols: {n_fam}")
+    print(f"    te_fam_* (superfamily) cols: {n_fam}  te_clade_* (family) cols: {n_clade}")
 
     # ── optional CRM file for centromere approximation ───────────────────────
     crm_intervals = None
@@ -2698,7 +2698,7 @@ def main():
         build_page2(pdf, merged)
         print("    Page 3: glyphosate stacked bars & BioClim")
         build_page3(pdf, merged)
-        print("    Page 4: per-sample stacked bars (family + clade, side-by-side)")
+        print("    Page 4: per-sample stacked bars (superfamily + family, side-by-side)")
         build_page4(pdf, merged)
         print("    Page 5: karyotype enrichment plot")
         build_page6(pdf, clusters_df, pos_df, fai_lengths=fai_lengths,
