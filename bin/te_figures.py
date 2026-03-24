@@ -2680,64 +2680,264 @@ def build_page_sample_sharing(pdf, pos_df, gly_map, merged=None):
 
 def build_page_insertion_spectrum(pdf, pos_df):
     """
-    TE insertion cluster frequency spectrum.
-    x = number of samples sharing a cluster (1 = singleton, 2 = doubleton, …)
-    y = number of clusters with that sample count (log scale).
+    TE insertion cluster frequency spectrum — 3 panels.
+    A (top, full-width): overall cluster size histogram, log y.
+    B (bottom-left):     per-superfamily singleton enrichment vs. global baseline,
+                         Fisher's exact + BH FDR, visualised as a lollipop plot.
+    C (bottom-right):    same for LTR-RT families (clades).
     """
-    from collections import Counter
+    from collections import Counter, defaultdict
     import matplotlib.ticker as mticker
+    import matplotlib.gridspec as mgridspec
+    import math as _math
+    from matplotlib.lines import Line2D
 
-    mat = build_sample_presence_matrix(pos_df)
-    if mat.empty:
+    if pos_df.empty:
         return
 
-    # Number of samples per cluster (column sums of binary matrix)
-    per_cluster = mat.values.sum(axis=0).astype(int)
-    spectrum    = Counter(per_cluster.tolist())
+    has_te_id = "TE_ID" in pos_df.columns
+    window    = 5
 
-    max_count = int(max(spectrum.keys()))
-    xs = list(range(1, max_count + 1))
-    ys = [spectrum.get(k, 0) for k in xs]
+    # ── Sweep-line clustering with TE label capture ──────────────────────────
+    def _register(te_id, sup_cnt, fam_cnt):
+        for order, sup, clade in parse_te_levels(te_id):
+            sup_cnt[f"{order}/{sup}"] += 1
+            if order == "LTR":
+                fam_cnt[clade] += 1
 
-    n_total  = int(sum(spectrum.values()))
-    n_sing   = spectrum.get(1, 0)
-    n_shared = n_total - n_sing
+    all_clusters = []   # list of (n_samples, dom_superfamily_or_None, dom_ltr_family_or_None)
 
-    fig, ax = plt.subplots(figsize=(11, 5.5))
-    fig.subplots_adjust(left=0.09, right=0.97, top=0.93, bottom=0.13)
+    for chrom, grp in pos_df.groupby("Chr"):
+        te_ids = grp["TE_ID"].tolist() if has_te_id else [""] * len(grp)
+        rows   = sorted(
+            zip(grp["Start"].astype(int), grp["End"].astype(int),
+                grp["sample_id"], te_ids),
+            key=lambda x: x[0],
+        )
+        if not rows:
+            continue
 
-    ax.bar(xs, ys, color=PALETTE[0], edgecolor="none", width=0.85)
+        cs, ce   = rows[0][0] - window, rows[0][1] + window
+        csids    = {rows[0][2]}
+        csup_cnt = Counter()
+        cfam_cnt = Counter()
+        _register(rows[0][3], csup_cnt, cfam_cnt)
 
-    ax.set_yscale("log")
-    # Explicitly pin y-ticks to powers of 10 only — bypasses auto-locator
-    import math as _math
-    _pow10 = [10**i for i in range(0, _math.ceil(_math.log10(max(ys))) + 1)]
-    ax.set_yticks(_pow10)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(
-        lambda v, _: f"{int(v):,}"))
-    ax.yaxis.set_minor_locator(mticker.NullLocator())
-    ax.set_xlim(0.3, max_count + 0.7)
-    ax.set_xlabel("Number of samples in TE insertion cluster")
-    ax.set_ylabel("Number of insertion clusters (log scale)")
+        def _flush(sids, sup_cnt, fam_cnt):
+            dom_sup = sup_cnt.most_common(1)[0][0] if sup_cnt else None
+            dom_fam = fam_cnt.most_common(1)[0][0] if fam_cnt else None
+            all_clusters.append((len(sids), dom_sup, dom_fam))
 
-    # Clean integer x-ticks: use MaxNLocator then force x=1 to always appear,
-    # ensuring no duplicate/collision at either end.
-    locator = mticker.MaxNLocator(integer=True, nbins=12, prune="both")
-    locator.set_params(min_n_ticks=5)
-    ax.xaxis.set_major_locator(locator)
-    fig.canvas.draw()                        # populate tick positions
-    ticks = [t for t in ax.get_xticks() if 1 <= t <= max_count]
-    if ticks and ticks[0] != 1:
-        ticks = [1] + ticks
-    ax.set_xticks(ticks)
+        for start, end, sid, te_id in rows[1:]:
+            es, ee = start - window, end + window
+            if es <= ce:
+                ce = max(ce, ee)
+                csids.add(sid)
+                _register(te_id, csup_cnt, cfam_cnt)
+            else:
+                _flush(csids, csup_cnt, cfam_cnt)
+                cs, ce, csids = es, ee, {sid}
+                csup_cnt      = Counter()
+                cfam_cnt      = Counter()
+                _register(te_id, csup_cnt, cfam_cnt)
+        _flush(csids, csup_cnt, cfam_cnt)
 
+    if not all_clusters:
+        return
+
+    # ── Global spectrum ──────────────────────────────────────────────────────
+    sup_sizes     = defaultdict(list)
+    fam_sizes     = defaultdict(list)
+    overall_counts = [n for n, _, _ in all_clusters]
+
+    for n, dom_sup, dom_fam in all_clusters:
+        if dom_sup:
+            sup_sizes[dom_sup].append(n)
+        if dom_fam:
+            fam_sizes[dom_fam].append(n)
+
+    overall_spec  = Counter(overall_counts)
+    max_count     = max(overall_spec.keys())
+    xs_all        = list(range(1, max_count + 1))
+    ys_all        = [overall_spec.get(k, 0) for k in xs_all]
+
+    n_total       = len(overall_counts)
+    n_sing        = overall_spec.get(1, 0)
+    n_shared      = n_total - n_sing
+    p_global_sing = n_sing / n_total        # global singleton rate
+
+    # ── Statistical testing (mirrors existing find_enriched_clusters BH) ─────
+    MIN_CLUSTERS = 20    # minimum per group to be included
+    TOP_N        = 12
+
+    def _bh_correct(pvals_arr):
+        """BH step-down FDR — identical approach to find_enriched_clusters."""
+        n          = len(pvals_arr)
+        sorted_idx = np.argsort(pvals_arr)
+        ranks      = np.empty(n, dtype=float)
+        ranks[sorted_idx] = np.arange(1, n + 1)
+        raw_q      = np.clip(pvals_arr * n / ranks, 0, 1)
+        # monotonicity: scan from largest p down, take running minimum
+        fdr        = (pd.Series(raw_q).iloc[sorted_idx[::-1]]
+                      .cummin()
+                      .reindex(pd.RangeIndex(n))
+                      .values)
+        return fdr
+
+    def _build_stats_df(group_sizes):
+        """
+        For each group with >= MIN_CLUSTERS clusters:
+          - 2×2 Fisher's exact: (group_singletons | group_shared)
+                             vs (rest_singletons  | rest_shared)
+          - log2FC = log2(group_singleton_rate / global_singleton_rate)
+          - BH FDR across all tested groups
+        Returns a DataFrame sorted by log2FC.
+        """
+        top_groups = sorted(
+            [k for k in group_sizes if len(group_sizes[k]) >= MIN_CLUSTERS],
+            key=lambda k: -len(group_sizes[k]),
+        )[:TOP_N]
+
+        rows = []
+        for gname in top_groups:
+            sz        = group_sizes[gname]
+            n_g       = len(sz)
+            n_g_sing  = sum(1 for x in sz if x == 1)
+            n_g_share = n_g - n_g_sing
+            rest_sing  = n_sing  - n_g_sing
+            rest_share = n_shared - n_g_share
+            try:
+                _, pval = stats.fisher_exact(
+                    [[n_g_sing,  n_g_share],
+                     [max(0, rest_sing), max(0, rest_share)]],
+                    alternative="two-sided",
+                )
+            except Exception:
+                pval = 1.0
+            p_obs  = n_g_sing / n_g
+            eps    = 0.5 / n_total      # pseudocount matching existing script style
+            log2fc = np.log2((p_obs + eps) / (p_global_sing + eps))
+            label  = gname.split("/")[-1] if "/" in gname else gname
+            rows.append({"name": gname, "label": label,
+                         "n": n_g, "log2fc": log2fc, "pval": pval})
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        fdr = _bh_correct(df["pval"].values.astype(float))
+        df["fdr"]   = fdr
+        df["ratio"] = np.exp2(df["log2fc"])   # observed / expected, centred at 1.0
+        return df.sort_values("ratio").reset_index(drop=True)
+
+    # ── Tick helpers ─────────────────────────────────────────────────────────
+    def _setup_log_yticks(ax, ymax):
+        pow10 = [10**i for i in range(0, _math.ceil(_math.log10(max(ymax, 2))) + 1)]
+        ax.set_yticks(pow10)
+        ax.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
+        ax.yaxis.set_minor_locator(mticker.NullLocator())
+
+    def _setup_xticks_bar(ax, xmax):
+        locator = mticker.MaxNLocator(integer=True, nbins=10, prune="both")
+        locator.set_params(min_n_ticks=5)
+        ax.xaxis.set_major_locator(locator)
+        fig.canvas.draw()
+        ticks = [t for t in ax.get_xticks() if 1 <= t <= xmax]
+        if ticks and ticks[0] != 1:
+            ticks = [1] + ticks
+        ax.set_xticks(ticks)
+
+    # ── Lollipop drawing ─────────────────────────────────────────────────────
+    COL_MORE = "#d62728"   # red  = more singletons than expected (recent/private)
+    COL_LESS = "#1f77b4"   # blue = fewer singletons than expected (old/widespread)
+    SIG_FDR  = 0.05
+
+    def _draw_lollipop(ax, df, panel_letter):
+        ax.text(-0.14, 1.06, panel_letter, transform=ax.transAxes,
+                fontsize=12, fontweight="bold", va="top")
+        if df.empty:
+            ax.text(0.5, 0.5,
+                    f"No groups with ≥ {MIN_CLUSTERS} clusters",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="#888", fontsize=8)
+            return
+
+        for i, row in df.iterrows():
+            r     = row["ratio"]
+            sig   = row["fdr"] < SIG_FDR
+            color = COL_MORE if r > 1 else COL_LESS
+            ax.plot([1.0, r], [i, i],
+                    color=color, lw=1.5, solid_capstyle="round", zorder=1)
+            ax.plot(r, i, "o",
+                    color=color, ms=7 if sig else 5,
+                    mfc=color if sig else "white", mew=1.5, zorder=2)
+
+        ax.axvline(1.0, color="#555", lw=0.8, ls="--", zorder=0)
+        ax.set_ylim(-0.6, len(df) - 0.4)
+        ax.set_yticks(range(len(df)))
+        ylabels = [
+            f"{row['label']}  (n={int(row['n']):,})"
+            + (" *" if row["fdr"] < SIG_FDR else "")
+            for _, row in df.iterrows()
+        ]
+        ax.set_yticklabels(ylabels, fontsize=7)
+        ax.set_xlabel("Singleton rate  (observed / expected)", fontsize=8)
+
+        xabs = (df["ratio"] - 1.0).abs().max()
+        ax.set_xlim(1 - xabs * 1.3 - 0.02, 1 + xabs * 1.3 + 0.02)
+
+        # Inline legend
+        leg_handles = [
+            Line2D([0], [0], marker="o", color=COL_MORE, ms=7,
+                   mfc=COL_MORE, mew=1.5, ls="none", label="more singletons"),
+            Line2D([0], [0], marker="o", color=COL_LESS, ms=7,
+                   mfc=COL_LESS, mew=1.5, ls="none", label="fewer singletons"),
+            Line2D([0], [0], marker="o", color="#888", ms=7,
+                   mfc="#888", mew=1.5, ls="none", label=f"FDR < {SIG_FDR}"),
+            Line2D([0], [0], marker="o", color="#888", ms=5,
+                   mfc="white", mew=1.5, ls="none", label="n.s."),
+        ]
+        ax.legend(handles=leg_handles, fontsize=6, framealpha=0.85,
+                  loc="lower right", borderpad=0.5, labelspacing=0.3)
+
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(11, 9))
+    gs  = mgridspec.GridSpec(2, 2, figure=fig,
+                             left=0.14, right=0.97, top=0.94, bottom=0.07,
+                             hspace=0.28, wspace=0.38,
+                             height_ratios=[1, 1.5])
+    ax_A = fig.add_subplot(gs[0, :])
+    ax_B = fig.add_subplot(gs[1, 0])
+    ax_C = fig.add_subplot(gs[1, 1])
+
+    # ── Panel A ───────────────────────────────────────────────────────────────
+    ax_A.bar(xs_all, ys_all, color=PALETTE[0], edgecolor="none", width=0.85)
+    ax_A.set_yscale("log")
+    _setup_log_yticks(ax_A, max(ys_all))
+    ax_A.set_xlim(0.3, max_count + 0.7)
+    ax_A.set_xlabel("Number of samples in TE insertion cluster")
+    ax_A.set_ylabel("Clusters (log scale)")
+    _setup_xticks_bar(ax_A, max_count)
+    ax_A.text(-0.08, 1.06, "A", transform=ax_A.transAxes,
+              fontsize=12, fontweight="bold", va="top")
     fig.text(
-        0.5, 0.01,
+        0.5, 0.965,
         f"Total clusters: {n_total:,}  ·  "
         f"Singletons: {n_sing:,} ({100*n_sing/n_total:.1f}%)  ·  "
         f"Shared (≥2 samples): {n_shared:,} ({100*n_shared/n_total:.1f}%)",
-        ha="center", va="bottom", fontsize=7.5, color="#555",
+        ha="center", va="top", fontsize=7.5, color="#555",
     )
+
+    # ── Panels B & C ──────────────────────────────────────────────────────────
+    if has_te_id:
+        df_sup = _build_stats_df(sup_sizes)
+        df_fam = _build_stats_df(fam_sizes)
+    else:
+        df_sup = pd.DataFrame()
+        df_fam = pd.DataFrame()
+
+    _draw_lollipop(ax_B, df_sup, "B")
+    _draw_lollipop(ax_C, df_fam, "C")
 
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
