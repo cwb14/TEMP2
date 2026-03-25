@@ -197,6 +197,7 @@ CONTEXT_ORDER = [
     "Intronic",
     f"Upstream {GENE_CONTEXT_WINDOW_LABEL}",
     f"Downstream {GENE_CONTEXT_WINDOW_LABEL}",
+    "Intergenic",
 ]
 
 def get_te_cols(merged, col_prefix, exclude_mixture=True):
@@ -472,13 +473,16 @@ def load_gff_full(path):
     return genes_df, exon_intervals
 
 
-def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW_BP):
+def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW_BP,
+                            fai_lengths=None):
     """Return total base-pairs (in kb) for each gene context across all genes.
 
     Used to normalise raw insertion counts to density (insertions per kb) so
     that contexts of different lengths are directly comparable.
 
-    Keys match CONTEXT_ORDER: Exonic, Intronic, Upstream …, Downstream …
+    Keys match CONTEXT_ORDER: Exonic, Intronic, Upstream …, Downstream …, Intergenic.
+    Intergenic length = total genome - genic bodies - upstream windows - downstream windows.
+    Requires fai_lengths dict {chr: length}; falls back to 1 kb if unavailable.
     """
     n_genes = len(genes_df)
     total_exon_bp   = 0
@@ -493,11 +497,21 @@ def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW
         total_exon_bp   += exon_bp
         total_intron_bp += max(0, gene_bp - exon_bp)
 
+    total_genic_bp = total_exon_bp + total_intron_bp
+    upstream_bp    = n_genes * window
+    downstream_bp  = n_genes * window
+    if fai_lengths:
+        total_genome_bp  = sum(fai_lengths.values())
+        intergenic_bp    = max(total_genome_bp - total_genic_bp - upstream_bp - downstream_bp, 1)
+    else:
+        intergenic_bp    = 1
+
     return {
         "Exonic":                                  max(total_exon_bp,   1) / 1000,
         "Intronic":                                max(total_intron_bp, 1) / 1000,
-        f"Upstream {GENE_CONTEXT_WINDOW_LABEL}":   (n_genes * window)   / 1000,
-        f"Downstream {GENE_CONTEXT_WINDOW_LABEL}": (n_genes * window)   / 1000,
+        f"Upstream {GENE_CONTEXT_WINDOW_LABEL}":   upstream_bp            / 1000,
+        f"Downstream {GENE_CONTEXT_WINDOW_LABEL}": downstream_bp          / 1000,
+        "Intergenic":                              intergenic_bp          / 1000,
     }
 
 
@@ -773,11 +787,12 @@ def compute_context_te_composition(pos_df, genes_df, exon_intervals,
                     elif dn:
                         context_arr[c0 + i] = 3
 
+        # Unclassified TEs (not in any genic/proximal window) → Intergenic
+        context_arr[context_arr == -1] = 4
+
         # Accumulate superfamily/family counts per context (aggregate + per-sample)
         for i in range(n_te):
             ctx_idx = int(context_arr[i])
-            if ctx_idx < 0:
-                continue
             ctx_name  = CONTEXTS[ctx_idx]
             te_id_str = str(te_ids[i])
             sid       = str(te_sids[i])
@@ -1938,7 +1953,7 @@ def panel_context_enrichment(ax, comp_df, panel_letter, top_n=10, label=None,
     return top_cols
 
 
-CONTEXT_COLORS = ["#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00"]
+CONTEXT_COLORS = ["#E41A1C", "#377EB8", "#4DAF4A", "#FF7F00", "#999999"]
 
 
 def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
@@ -3160,7 +3175,7 @@ def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     plt.close(fig)
 
 
-def build_page_gene_context(pdf, merged, pos_df, gff_path):
+def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None):
     """Page 6: panels A (disruption), B (metagene), C (TE superfamily), D (family)."""
     print("    Loading GFF for gene-context page …")
     genes_df, exon_intervals = load_gff_full(gff_path)
@@ -3188,7 +3203,8 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path):
 
     print("    Computing context region lengths for density normalisation …")
     ctx_lengths_kb = compute_context_lengths(genes_df, exon_intervals,
-                                             window=GENE_CONTEXT_WINDOW_BP)
+                                             window=GENE_CONTEXT_WINDOW_BP,
+                                             fai_lengths=fai_lengths)
     print("    Context lengths (kb): " +
           ", ".join(f"{k}: {v:,.1f}" for k, v in ctx_lengths_kb.items()))
 
@@ -3528,7 +3544,8 @@ def main():
         build_page_insertion_spectrum(pdf, pos_df)
         if args.gff:
             print("    Page 6: gene-context disruptions, metagene & enrichment")
-            build_page_gene_context(pdf, merged, pos_df, args.gff)
+            build_page_gene_context(pdf, merged, pos_df, args.gff,
+                                    fai_lengths=fai_lengths)
 
         print("    Final page: command reproducibility")
         build_page_command(pdf)
