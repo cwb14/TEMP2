@@ -481,10 +481,13 @@ def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW
     that contexts of different lengths are directly comparable.
 
     Keys match CONTEXT_ORDER: Exonic, Intronic, Upstream …, Downstream …, Intergenic.
-    Intergenic length = total genome - genic bodies - upstream windows - downstream windows.
+
+    Intergenic = everything farther than `window` bp from any gene (strand-agnostic).
+    Computed as: total_genome_bp minus the merged union of [start-window, end+window]
+    across all genes (per chromosome, capped at chromosome boundaries).  This correctly
+    handles overlapping genes and windows without double-counting.
     Requires fai_lengths dict {chr: length}; falls back to 1 kb if unavailable.
     """
-    n_genes = len(genes_df)
     total_exon_bp   = 0
     total_intron_bp = 0
     for row in genes_df.itertuples(index=False):
@@ -497,14 +500,39 @@ def compute_context_lengths(genes_df, exon_intervals, window=GENE_CONTEXT_WINDOW
         total_exon_bp   += exon_bp
         total_intron_bp += max(0, gene_bp - exon_bp)
 
-    total_genic_bp = total_exon_bp + total_intron_bp
-    upstream_bp    = n_genes * window
-    downstream_bp  = n_genes * window
+    # Upstream / downstream window lengths: use merged intervals per chromosome so
+    # overlapping windows between adjacent genes are not double-counted.
+    # Strandedness is irrelevant here — the physical proximal zone around each gene
+    # is [start - window, end + window] regardless of strand.
+    total_proximal_bp = 0
+    for chrom, grp in genes_df.groupby("chr"):
+        chr_len = fai_lengths.get(chrom, None) if fai_lengths else None
+        ivs = sorted(
+            (max(0, int(r.start) - window),
+             (min(int(r.end) + window, chr_len - 1) if chr_len else int(r.end) + window))
+            for r in grp.itertuples(index=False)
+        )
+        # Merge overlapping intervals
+        merged = []
+        for s, e in ivs:
+            if merged and s <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        total_proximal_bp += sum(e - s + 1 for s, e in merged)
+
+    # Upstream and downstream windows are each half of the proximal zone around gene
+    # ends; report them separately as n_genes * window (un-merged) for panel labels,
+    # but use the merged proximal total for intergenic.
+    n_genes       = len(genes_df)
+    upstream_bp   = n_genes * window
+    downstream_bp = n_genes * window
+
     if fai_lengths:
-        total_genome_bp  = sum(fai_lengths.values())
-        intergenic_bp    = max(total_genome_bp - total_genic_bp - upstream_bp - downstream_bp, 1)
+        total_genome_bp = sum(fai_lengths.values())
+        intergenic_bp   = max(total_genome_bp - total_proximal_bp, 1)
     else:
-        intergenic_bp    = 1
+        intergenic_bp   = 1
 
     return {
         "Exonic":                                  max(total_exon_bp,   1) / 1000,
