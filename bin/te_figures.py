@@ -2702,7 +2702,7 @@ def build_page_insertion_spectrum(pdf, pos_df):
     # ── Sweep-line clustering with TE label capture ──────────────────────────
     def _register(te_id, sup_cnt, fam_cnt):
         for order, sup, clade in parse_te_levels(te_id):
-            sup_cnt[f"{order}/{sup}"] += 1
+            sup_cnt[sup] += 1
             if order == "LTR":
                 fam_cnt[clade] += 1
 
@@ -2769,7 +2769,7 @@ def build_page_insertion_spectrum(pdf, pos_df):
 
     # ── Statistical testing (mirrors existing find_enriched_clusters BH) ─────
     MIN_CLUSTERS = 20    # minimum per group to be included
-    TOP_N        = 12
+    TOP_N        = 50
 
     def _bh_correct(pvals_arr):
         """BH step-down FDR — identical approach to find_enriched_clusters."""
@@ -2878,7 +2878,6 @@ def build_page_insertion_spectrum(pdf, pos_df):
         ax.set_yticks(range(len(df)))
         ylabels = [
             f"{row['label']}  (n={int(row['n']):,})"
-            + (" *" if row["fdr"] < SIG_FDR else "")
             for _, row in df.iterrows()
         ]
         ax.set_yticklabels(ylabels, fontsize=7)
