@@ -187,6 +187,13 @@ VAR_DESC = {
 
 
 
+# Fixed display order for Panel E (K2P age) — mirrors Panel C top-to-bottom.
+# Families absent from the age file are silently skipped.
+LTR_AGE_FAMILY_ORDER = [
+    "SIRE", "Tekay", "unknown", "Ale", "Retand", "Athila",
+    "Angela", "TAR", "Ikeros", "Ivana", "Bianca", "Reina", "CRM", "mixture",
+]
+
 GENE_CONTEXT_WINDOW_BP = 1000
 #GENE_CONTEXT_WINDOW_BP = 2000
 #GENE_CONTEXT_WINDOW_LABEL = "2kb"
@@ -225,6 +232,11 @@ def parse_args():
                    help="CRM element file (one entry per line, format "
                         "'chr:start-end#LTR/Gypsy/CRM') used to overlay "
                         "centromere-proximal regions on the karyotype (page 5).")
+    p.add_argument("--ltr-age",    default=None, dest="ltr_age",
+                   help="LTR-RT age file (col1=locus#LTR/Superfamily/Family, "
+                        "col11=K2P divergence between the two LTRs). Families "
+                        "with >100 elements are plotted as stacked K2P density "
+                        "histograms on the gene-context page (requires --gff).")
     return p.parse_args()
 
 
@@ -252,6 +264,40 @@ def parse_crm(path):
             start, end = int(m.group(2)), int(m.group(3))
             intervals.setdefault(chrom, []).append((start, end))
     return intervals
+
+
+# ── LTR-RT age loader ───────────────────────────────────────────────────────
+
+def load_ltr_age(path):
+    """Parse an LTR-RT age file.  Returns dict {family_name: [k2p_values]}.
+
+    Expected format (whitespace-delimited, one element per line):
+        col 1  : locus identifier, e.g. NC_057761.1:45750-55571#LTR/Copia/SIRE
+        col 11 : K2P divergence between the element's two LTRs (float)
+    The family name is the last '/'-separated token after '#' in col 1.
+    Lines with < 11 columns or non-numeric col 11 are silently skipped.
+    """
+    family_k2p = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 11:
+                continue
+            col1 = parts[0]
+            if '#' in col1:
+                family_path = col1.split('#', 1)[1]   # e.g. "LTR/Copia/SIRE"
+                family_name = family_path.split('/')[-1]
+            else:
+                family_name = col1
+            try:
+                k2p = float(parts[10])                 # 11th column (0-indexed: 10)
+            except (ValueError, IndexError):
+                continue
+            family_k2p.setdefault(family_name, []).append(k2p)
+    return family_k2p
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -3203,8 +3249,362 @@ def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     plt.close(fig)
 
 
-def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None):
-    """Page 6: panels A (disruption), B (metagene), C (TE superfamily), D (family)."""
+def compute_intergenic_log2fc(clade_comp_df, top_clades, ctx_lengths_kb=None):
+    """Return a Series {family: intergenic log2(obs/exp)}.
+
+    Replicates the exact normalisation used by panel_context_enrichment so the
+    values match those shown in the heatmap (length-normalised, clamped ±3).
+    """
+    CONTEXTS = [c for c in CONTEXT_ORDER if c in clade_comp_df.index]
+    if not CONTEXTS:
+        return pd.Series(dtype=float)
+
+    df = clade_comp_df.loc[CONTEXTS].copy()
+    top_cols = [c for c in top_clades if c in df.columns]
+    if not top_cols:
+        return pd.Series(dtype=float)
+    df = df[top_cols].astype(float)
+
+    if ctx_lengths_kb:
+        for ctx in list(df.index):
+            kb = ctx_lengths_kb.get(ctx, None)
+            if kb and kb > 0:
+                df.loc[ctx] = df.loc[ctx] / kb
+
+    genome_total = df.sum(axis=1)
+    total = genome_total.sum()
+    if total == 0:
+        return pd.Series(dtype=float)
+
+    expected = (genome_total / total).clip(lower=1e-10)
+    cat_totals = df.sum(axis=0).replace(0, 1)
+    observed = df.div(cat_totals, axis=1)
+    log2fc = np.log2(observed.div(expected, axis=0).clip(lower=1e-6)).clip(-3, 3)
+
+    if "Intergenic" not in log2fc.index:
+        return pd.Series(dtype=float)
+    return log2fc.loc["Intergenic"]
+
+
+def panel_intergenic_regression(ax, clade_comp_df, merged, top_clades,
+                                ctx_lengths_kb=None, panel_letter="A"):
+    """Scatter + OLS: intergenic log2(obs/exp) vs mean insertions per sample.
+
+    One data point per LTR-RT family (LTR-RT families only, matching heatmap).
+    Aesthetics mirror the page-2 regressions.  Stats annotation is placed
+    inside the axes (bottom-centre) to avoid overlap with the x-axis label.
+    """
+    intergenic_fc = compute_intergenic_log2fc(clade_comp_df, top_clades,
+                                              ctx_lengths_kb)
+    if intergenic_fc.empty:
+        ax.text(0.5, 0.5, "No intergenic data", ha="center",
+                transform=ax.transAxes)
+        ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                fontsize=11, fontweight="bold", va="bottom", ha="right",
+                clip_on=False)
+        return
+
+    clade_map = {c.replace("te_clade_", ""): c
+                 for c in merged.columns if c.startswith("te_clade_")}
+
+    families, x_vals, y_vals = [], [], []
+    for fam in intergenic_fc.index:
+        if fam in clade_map:
+            families.append(fam)
+            x_vals.append(float(merged[clade_map[fam]].mean()))
+            y_vals.append(float(intergenic_fc[fam]))
+
+    if len(families) < 3:
+        ax.text(0.5, 0.5, "Insufficient family data", ha="center",
+                transform=ax.transAxes)
+        ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                fontsize=11, fontweight="bold", va="bottom", ha="right",
+                clip_on=False)
+        return
+
+    xc = np.array(x_vals, dtype=float)
+    yc = np.array(y_vals, dtype=float)
+
+    ax.scatter(xc, yc, s=16, alpha=0.55, color=PALETTE[0],
+               edgecolors="none", zorder=3)
+
+    r2 = np.nan
+    try:
+        m, b = np.polyfit(xc, yc, 1)
+        xl = np.linspace(xc.min(), xc.max(), 200)
+        ax.plot(xl, m * xl + b, color="#CC3333", lw=1.6,
+                linestyle="--", zorder=4, alpha=0.85)
+        yhat   = m * xc + b
+        ss_res = ((yc - yhat) ** 2).sum()
+        ss_tot = ((yc - yc.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    except Exception:
+        pass
+
+    rho, pval = safe_corr(pd.Series(xc), pd.Series(yc), "spearman")
+    parts = []
+    if not np.isnan(r2):   parts.append(f"R² = {r2:.3f}")
+    if not np.isnan(rho):  parts.append(f"ρ = {rho:.3f}")
+    if not np.isnan(pval): parts.append(f"p = {pval:.2e}")
+    parts.append(f"n = {len(xc)}")
+    annot = ",  ".join(parts)
+
+    # Place stats *inside* the axes (top-left) to avoid overlapping the xlabel
+    ax.text(0.04, 0.97, annot, transform=ax.transAxes,
+            fontsize=7, color="#333", ha="left", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                      ec="#bbbbbb", alpha=0.93, lw=0.6))
+
+    ax.set_xlabel("Mean Insertions per Sample")
+    ax.set_ylabel("Intergenic log₂(obs/exp)")
+    ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+            fontsize=11, fontweight="bold", va="bottom", ha="right",
+            clip_on=False)
+
+    # Label each family point
+    for xi, yi, fam in zip(x_vals, y_vals, families):
+        ax.annotate(fam, (xi, yi), fontsize=5.5, color="#333333",
+                    xytext=(3, 3), textcoords="offset points")
+
+
+def panel_ref_count_regression(ax, merged, ltr_age, top_clades, panel_letter=None):
+    """Scatter + OLS: Mean Insertions per Sample vs LTR-RT count in the reference.
+
+    Reference count per family = number of elements in the LTR age file for
+    that family (len(ltr_age[family])).  One point per LTR-RT family.
+    Stats annotation placed inside the axes (top-left) to avoid label overlap.
+    """
+    if not ltr_age:
+        ax.text(0.5, 0.5, "No LTR age data", ha="center",
+                transform=ax.transAxes)
+        if panel_letter:
+            ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                    fontsize=11, fontweight="bold", va="bottom", ha="right",
+                    clip_on=False)
+        return
+
+    clade_map = {c.replace("te_clade_", ""): c
+                 for c in merged.columns if c.startswith("te_clade_")}
+
+    families, x_vals, y_vals = [], [], []
+    for fam in top_clades:
+        if fam in clade_map and fam in ltr_age:
+            families.append(fam)
+            x_vals.append(float(merged[clade_map[fam]].mean()))
+            y_vals.append(float(len(ltr_age[fam])))
+
+    if len(families) < 3:
+        ax.text(0.5, 0.5, "Insufficient family data", ha="center",
+                transform=ax.transAxes)
+        if panel_letter:
+            ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                    fontsize=11, fontweight="bold", va="bottom", ha="right",
+                    clip_on=False)
+        return
+
+    xc = np.array(x_vals, dtype=float)
+    yc = np.array(y_vals, dtype=float)
+
+    ax.scatter(xc, yc, s=16, alpha=0.55, color=PALETTE[0],
+               edgecolors="none", zorder=3)
+
+    r2 = np.nan
+    try:
+        m, b = np.polyfit(xc, yc, 1)
+        xl = np.linspace(xc.min(), xc.max(), 200)
+        ax.plot(xl, m * xl + b, color="#CC3333", lw=1.6,
+                linestyle="--", zorder=4, alpha=0.85)
+        yhat   = m * xc + b
+        ss_res = ((yc - yhat) ** 2).sum()
+        ss_tot = ((yc - yc.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    except Exception:
+        pass
+
+    rho, pval = safe_corr(pd.Series(xc), pd.Series(yc), "spearman")
+    parts = []
+    if not np.isnan(r2):   parts.append(f"R² = {r2:.3f}")
+    if not np.isnan(rho):  parts.append(f"ρ = {rho:.3f}")
+    if not np.isnan(pval): parts.append(f"p = {pval:.2e}")
+    parts.append(f"n = {len(xc)}")
+    annot = ",  ".join(parts)
+
+    ax.text(0.04, 0.97, annot, transform=ax.transAxes,
+            fontsize=7, color="#333", ha="left", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                      ec="#bbbbbb", alpha=0.93, lw=0.6))
+
+    ax.set_xlabel("Mean Insertions per Sample")
+    ax.set_ylabel("Reference LTR-RT Count")
+
+    if panel_letter:
+        ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                fontsize=11, fontweight="bold", va="bottom", ha="right",
+                clip_on=False)
+
+    for xi, yi, fam in zip(x_vals, y_vals, families):
+        ax.annotate(fam, (xi, yi), fontsize=5.5, color="#333333",
+                    xytext=(3, 3), textcoords="offset points")
+
+
+def panel_metagene_single(ax, metagene_df, panel_letter="D"):
+    """Single collapsed metagene bar plot — all samples pooled across regions."""
+    if metagene_df.empty:
+        ax.text(0.5, 0.5, "No metagene data", ha="center",
+                transform=ax.transAxes, fontsize=8)
+        ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+                fontsize=11, fontweight="bold", va="bottom", ha="right",
+                clip_on=False)
+        return
+
+    x_abs = int(max(abs(metagene_df["bin_center"].min()),
+                    abs(metagene_df["bin_center"].max())) + 25)
+    bin_size = 50
+
+    grp = metagene_df.groupby("bin_center")["freq"].agg(["mean", "std", "count"])
+    grp["se"] = grp["std"] / np.sqrt(grp["count"].clip(lower=1))
+    bc = grp.index.values
+    mn = grp["mean"].values
+    se = grp["se"].values
+
+    Y_MAX    = 0.0009
+    Y_TICKS  = [0.0000, 0.0004, 0.0008]
+    Y_LABELS = ["0.0000", "0.0004", "0.0008"]
+
+    ax.bar(bc, mn, width=bin_size - 1, color=PALETTE[0], alpha=0.75,
+           edgecolor="none", align="center")
+    ax.errorbar(bc, mn, yerr=se, fmt="none", ecolor="#333333",
+                elinewidth=0.6, capsize=1.5, capthick=0.6)
+    ax.axvline(0, color="#555555", lw=0.9, linestyle="--", zorder=5)
+    ax.set_ylim(0, Y_MAX)
+    ax.set_xlim(-x_abs, x_abs)
+    ax.set_yticks(Y_TICKS)
+    ax.set_yticklabels(Y_LABELS)
+    ax.set_ylabel("Frequency of TE insertion\nin bin (50 bp)", fontsize=7, labelpad=4)
+    ax.set_xlabel("Distance from Gene Boundary (bp)")
+    ax.tick_params(axis="x", labelsize=7)
+    ax.tick_params(axis="y", labelsize=6)
+    ax.grid(axis="y", alpha=0.20)
+    ax.grid(axis="x", alpha=0)
+
+    # Upstream vs downstream significance test (Mann-Whitney U, per sample)
+    try:
+        up_sums, dn_sums = [], []
+        for sid, sgrp in metagene_df.groupby("sample_id"):
+            up_sums.append(sgrp.loc[sgrp["bin_center"] < 0, "freq"].sum())
+            dn_sums.append(sgrp.loc[sgrp["bin_center"] > 0, "freq"].sum())
+        up_arr, dn_arr = np.array(up_sums), np.array(dn_sums)
+        if len(up_arr) >= 3 and len(dn_arr) >= 3:
+            _, pval = stats.mannwhitneyu(up_arr, dn_arr, alternative="two-sided")
+            direction = ("Up > Dn" if np.median(up_arr) > np.median(dn_arr)
+                         else "Dn > Up")
+            sig = ("***" if pval < 0.001 else "**" if pval < 0.01
+                   else "*" if pval < 0.05 else "ns")
+            ax.text(0.98, 0.92, f"{direction}  p={pval:.3g} {sig}",
+                    transform=ax.transAxes, fontsize=5.5,
+                    ha="right", va="top", color="#555555", fontstyle="italic")
+    except Exception:
+        pass
+
+    ax.text(-0.06, 1.04, panel_letter, transform=ax.transAxes,
+            fontsize=11, fontweight="bold", va="bottom", ha="right",
+            clip_on=False)
+
+
+def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E"):
+    """Stacked K2P density histograms, one strip per LTR-RT family.
+
+    Family order follows LTR_AGE_FAMILY_ORDER (matching Panel C top-to-bottom).
+    Only families present in ltr_age_data are plotted; families in the fixed
+    order that are absent from the data are silently skipped.
+    Bins: 0–0.15 in steps of 0.003.  Values above 0.15 are excluded.
+    The distribution peak is identified via KDE (avoids local histogram noise)
+    and marked with a dotted vertical line + label.
+    """
+    from scipy.stats import gaussian_kde
+
+    K2P_MAX  = 0.15
+    BIN_SIZE = 0.003
+    bins = np.arange(0, K2P_MAX + BIN_SIZE, BIN_SIZE)
+    bin_centers = (bins[:-1] + bins[1:]) / 2.0
+
+    # Use fixed Panel-C order; skip families absent from the data
+    families = [(fam, ltr_age_data[fam])
+                for fam in LTR_AGE_FAMILY_ORDER
+                if fam in ltr_age_data]
+
+    if not families or not axes:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No LTR age data", ha="center",
+                    transform=ax.transAxes, fontsize=8)
+        if axes:
+            axes[0].text(-0.06, 1.04, panel_letter, transform=axes[0].transAxes,
+                         fontsize=11, fontweight="bold", va="bottom", ha="right",
+                         clip_on=False)
+        return
+
+    for fi, (ax, (family, values)) in enumerate(zip(axes, families)):
+        vals = np.array(values, dtype=float)
+        vals_clipped = vals[vals <= K2P_MAX]
+        counts, _ = np.histogram(vals_clipped, bins=bins)
+        density = counts / max(len(values), 1)
+
+        color = CLADE_PALETTE[fi % len(CLADE_PALETTE)]
+        ax.bar(bin_centers, density, width=BIN_SIZE * 0.85,
+               color=color, alpha=0.78, edgecolor="none")
+
+        # KDE peak — evaluate on a fine grid to find the smooth mode
+        peak_x = np.nan
+        if len(vals_clipped) >= 5:
+            try:
+                kde_fn   = gaussian_kde(vals_clipped, bw_method="scott")
+                eval_pts = np.linspace(0, K2P_MAX, 1000)
+                kde_vals = kde_fn(eval_pts)
+                peak_x   = eval_pts[np.argmax(kde_vals)]
+            except Exception:
+                pass
+
+        if not np.isnan(peak_x):
+            ax.axvline(peak_x, color=color, lw=0.9, linestyle=":",
+                       alpha=0.95, zorder=5)
+            ax.text(peak_x + K2P_MAX * 0.015,
+                    ax.get_ylim()[1] * 0.92 if ax.get_ylim()[1] > 0
+                    else density.max() * 0.92,
+                    f"{peak_x:.3f}",
+                    fontsize=5.5, color="#222222", va="top", ha="left",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                              ec="none", alpha=0.75))
+
+        ax.text(0.98, 0.97, f"{family}  (n={len(values):,})",
+                transform=ax.transAxes, fontsize=6,
+                ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                          ec="none", alpha=0.80))
+
+        ax.set_xlim(0, K2P_MAX)
+        ax.tick_params(axis="y", labelsize=5.5)
+        ax.grid(axis="y", alpha=0.20)
+        ax.grid(axis="x", alpha=0)
+
+        if fi < len(families) - 1:
+            ax.tick_params(axis="x", labelbottom=False)
+        else:
+            ax.set_xlabel("K2P Divergence", fontsize=7)
+            ax.tick_params(axis="x", labelsize=7)
+
+    if axes:
+        mid = len(axes) // 2
+        axes[min(mid, len(axes) - 1)].set_ylabel(
+            "Proportion", fontsize=7, labelpad=4)
+        axes[0].text(-0.06, 1.04, panel_letter, transform=axes[0].transAxes,
+                     fontsize=11, fontweight="bold", va="bottom", ha="right",
+                     clip_on=False)
+
+
+def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None,
+                            ltr_age=None):
+    """Page 6: panels A (intergenic regression), B (LTR-RT superfamily context),
+    C (LTR-RT family context), D (collapsed metagene), E (K2P age distributions)."""
     print("    Loading GFF for gene-context page …")
     genes_df, exon_intervals = load_gff_full(gff_path)
     if genes_df.empty:
@@ -3236,108 +3636,116 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None):
     print("    Context lengths (kb): " +
           ", ".join(f"{k}: {v:,.1f}" for k, v in ctx_lengths_kb.items()))
 
-    # Canonical region order (same rule as page 1 panel C / page 6 panel A)
-    reg_order = _canonical_region_order(merged)
+    # ── Determine age families (needed for layout) ───────────────────────
+    # Count families that appear in both the fixed Panel-C order and the data.
+    n_age = (sum(1 for fam in LTR_AGE_FAMILY_ORDER if fam in (ltr_age or {}))
+             if ltr_age else 0)
 
-    # Determine which regions actually have metagene data so the right-column
-    # axis count exactly matches what panel_metagene will draw (no blank strips).
-    reg_col = "Region_new" if "Region_new" in merged.columns else None
-    if reg_order and reg_col and not metagene_df.empty:
-        meta_sids       = set(metagene_df["sample_id"].unique())
-        present_regions = set(
-            merged.loc[merged.index.isin(meta_sids), reg_col]
-            .dropna().astype(str)
-            .loc[lambda s: s.str.lower() != "nan"]
-            .unique()
-        )
-        plot_regions = [r for r in reg_order if r in present_regions]
-    else:
-        plot_regions = reg_order or []
-    n_regions = max(len(plot_regions), 1)
-
-    # ── Single page: A (disruption), B (superfam violin+heatmap), C (fam
-    #    violin+heatmap) on left; D (metagene strips) on right ────────────
-    fig_h = max(11.0, n_regions * 0.65 + 5.0)
+    # ── Figure layout ────────────────────────────────────────────────────
+    # Right column height: 1 metagene strip + n_age K2P strips.
+    # Use enough height so strips are readable (~0.55 in each).
+    fig_h = max(11.0, (1 + n_age) * 0.55 + 5.0)
     fig = plt.figure(figsize=(11, fig_h))
     outer = gridspec.GridSpec(1, 2, figure=fig,
                               wspace=0.45,
                               left=0.09, right=0.97,
                               top=0.97, bottom=0.04)
 
-    # Left column: 3 logical panels (A, B, C) with moderate spacing between them.
-    # B and C each split into a tight violin+heatmap pair internally.
+    # Left column: 3 logical panels (A, B, C) with moderate spacing.
+    # A is split into two stacked regressions; B and C each split into a
+    # tight violin+heatmap pair internally.
     left_gs = gridspec.GridSpecFromSubplotSpec(
         3, 1, subplot_spec=outer[0, 0],
         hspace=0.30,
-        height_ratios=[0.85, 1.5, 1.5])
+        height_ratios=[1.70, 1.5, 1.5])
 
-    # Panel A: gene disruption
-    ax_A = fig.add_subplot(left_gs[0, 0])
-    panel_gene_disruption(ax_A, disruption_df, merged,
-                          n_genes=n_genes, panel_letter="A",
-                          region_order=reg_order)
+    # Compute top clades here so Panel A regressions and Panel C can use them
+    clade_col_totals = clade_comp_df.sum(axis=0).sort_values(ascending=False)
+    top_clades = clade_col_totals.head(13).index.tolist()
+    n_clades = len(top_clades)
 
-    # Panel B: TE superfamily — proportion violin (top) + enrichment heatmap (bottom)
-    # Tight internal spacing (hspace) so they read as one unit
-    B_gs = gridspec.GridSpecFromSubplotSpec(
-        2, 1, subplot_spec=left_gs[1, 0],
-        hspace=0.05,
-        height_ratios=[1.0, 0.55])
-    ax_B_violin = fig.add_subplot(B_gs[0, 0])
-    ax_B_heat   = fig.add_subplot(B_gs[1, 0])
+    # Panel A: two stacked regressions (both x = Mean Insertions per Sample)
+    #   top:    vs Intergenic log2(obs/exp)  (matching heatmap on Panel C)
+    #   bottom: vs LTR-RT count in reference genome
+    A_gs = gridspec.GridSpecFromSubplotSpec(
+        2, 1, subplot_spec=left_gs[0, 0], hspace=0.55)
+    ax_A1 = fig.add_subplot(A_gs[0, 0])
+    ax_A2 = fig.add_subplot(A_gs[1, 0])
+    panel_intergenic_regression(ax_A1, clade_comp_df, merged, top_clades,
+                                ctx_lengths_kb=ctx_lengths_kb,
+                                panel_letter="A")
+    panel_ref_count_regression(ax_A2, merged, ltr_age, top_clades,
+                               panel_letter="B")
 
-#    fam_comp_df = fam_comp_df.drop(columns=["mixture"], errors="ignore")
-#    fam_long    = fam_long[fam_long["category"] != "mixture"].copy()
-    fam_comp_df = fam_comp_df.drop(columns=["mixture"], errors="ignore")
-    fam_long = fam_long[fam_long["category"] != "mixture"].copy()
-    fam_col_totals = fam_comp_df.sum(axis=0).sort_values(ascending=False)
-    top_fams = fam_col_totals.head(10).index.tolist()
-    n_fams = len(top_fams)
-    panel_context_prop_violin(ax_B_violin, fam_long,
-                              panel_letter="B", top_n=10,
-                              show_xticklabels=False,
-                              top_cats_override=top_fams,
-                              context_lengths_kb=ctx_lengths_kb)
-    panel_context_enrichment(ax_B_heat, fam_comp_df,
-                             panel_letter=None, top_n=10, label="TE Superfamily",
-                             show_xticklabels=True,
-                             top_cats_override=top_fams,
-                             context_lengths_kb=ctx_lengths_kb)
-    # Align x-limits so violin positions and heatmap columns line up
-    ax_B_violin.set_xlim(-0.5, n_fams - 0.5)
-    ax_B_heat.set_xlim(-0.5, n_fams - 0.5)
-
-    # Panel C: LTR-RT family — proportion violin (top) + enrichment heatmap (bottom)
+    # Panel C: TE superfamily — proportion violin (top) + enrichment heatmap (bottom)
     C_gs = gridspec.GridSpecFromSubplotSpec(
-        2, 1, subplot_spec=left_gs[2, 0],
+        2, 1, subplot_spec=left_gs[1, 0],
         hspace=0.05,
         height_ratios=[1.0, 0.55])
     ax_C_violin = fig.add_subplot(C_gs[0, 0])
     ax_C_heat   = fig.add_subplot(C_gs[1, 0])
 
-    clade_col_totals = clade_comp_df.sum(axis=0).sort_values(ascending=False)
-    top_clades = clade_col_totals.head(12).index.tolist()
-    n_clades = len(top_clades)
-    panel_context_prop_violin(ax_C_violin, clade_long,
-                              panel_letter="C", top_n=12,
+    fam_comp_df = fam_comp_df.drop(columns=["mixture"], errors="ignore")
+    fam_long = fam_long[fam_long["category"] != "mixture"].copy()
+    fam_col_totals = fam_comp_df.sum(axis=0).sort_values(ascending=False)
+    top_fams = fam_col_totals.head(10).index.tolist()
+    n_fams = len(top_fams)
+    panel_context_prop_violin(ax_C_violin, fam_long,
+                              panel_letter="C", top_n=10,
+                              show_xticklabels=False,
+                              top_cats_override=top_fams,
+                              context_lengths_kb=ctx_lengths_kb)
+    panel_context_enrichment(ax_C_heat, fam_comp_df,
+                             panel_letter=None, top_n=10, label="TE Superfamily",
+                             show_xticklabels=True,
+                             top_cats_override=top_fams,
+                             context_lengths_kb=ctx_lengths_kb)
+    ax_C_violin.set_xlim(-0.5, n_fams - 0.5)
+    ax_C_heat.set_xlim(-0.5, n_fams - 0.5)
+
+    # Panel D: LTR-RT family — proportion violin (top) + enrichment heatmap (bottom)
+    D_gs = gridspec.GridSpecFromSubplotSpec(
+        2, 1, subplot_spec=left_gs[2, 0],
+        hspace=0.05,
+        height_ratios=[1.0, 0.55])
+    ax_D_violin = fig.add_subplot(D_gs[0, 0])
+    ax_D_heat   = fig.add_subplot(D_gs[1, 0])
+
+    panel_context_prop_violin(ax_D_violin, clade_long,
+                              panel_letter="D", top_n=13,
                               show_xticklabels=False,
                               top_cats_override=top_clades,
                               context_lengths_kb=ctx_lengths_kb)
-    panel_context_enrichment(ax_C_heat, clade_comp_df,
-                             panel_letter=None, top_n=12, label="LTR-RT Family",
+    panel_context_enrichment(ax_D_heat, clade_comp_df,
+                             panel_letter=None, top_n=13, label="LTR-RT Family",
                              show_xticklabels=True,
                              top_cats_override=top_clades,
                              context_lengths_kb=ctx_lengths_kb)
-    ax_C_violin.set_xlim(-0.5, n_clades - 0.5)
-    ax_C_heat.set_xlim(-0.5, n_clades - 0.5)
+    ax_D_violin.set_xlim(-0.5, n_clades - 0.5)
+    ax_D_heat.set_xlim(-0.5, n_clades - 0.5)
 
-    # Right column: Panel D — metagene strips, one per region
-    right_gs = gridspec.GridSpecFromSubplotSpec(
-        n_regions, 1, subplot_spec=outer[0, 1],
-        hspace=0.08)
-    axes_D = [fig.add_subplot(right_gs[i, 0]) for i in range(n_regions)]
-    panel_metagene(axes_D, metagene_df, merged, panel_letter="D",
-                   region_order=plot_regions)
+    # ── Right column: Panel E (collapsed metagene) + Panel F (K2P age) ──
+    if n_age > 0:
+        # Split right column into metagene (top) and age stack (bottom).
+        # Give each age strip ~60 % of a metagene strip's height.
+        right_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 1, subplot_spec=outer[0, 1],
+            hspace=0.12,
+            height_ratios=[1.0, n_age * 0.60])
+        ax_E = fig.add_subplot(right_gs[0, 0])
+        panel_metagene_single(ax_E, metagene_df, panel_letter="E")
+
+        age_gs = gridspec.GridSpecFromSubplotSpec(
+            n_age, 1, subplot_spec=right_gs[1, 0],
+            hspace=0.08)
+        axes_F = [fig.add_subplot(age_gs[i, 0]) for i in range(n_age)]
+        panel_ltr_age_density(axes_F, ltr_age, panel_letter="F")
+    else:
+        # No age data: single collapsed metagene fills the right column
+        right_gs = gridspec.GridSpecFromSubplotSpec(
+            1, 1, subplot_spec=outer[0, 1])
+        ax_E = fig.add_subplot(right_gs[0, 0])
+        panel_metagene_single(ax_E, metagene_df, panel_letter="E")
 
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -3430,6 +3838,19 @@ def main():
     n_clade = sum(1 for c in merged.columns if c.startswith("te_clade_"))
     n_fam   = sum(1 for c in merged.columns if c.startswith("te_fam_"))
     print(f"    te_fam_* (superfamily) cols: {n_fam}  te_clade_* (family) cols: {n_clade}")
+
+    # ── optional LTR-RT age file ─────────────────────────────────────────────
+    ltr_age = None
+    if args.ltr_age:
+        try:
+            ltr_age = load_ltr_age(args.ltr_age)
+            n_qualifying = sum(1 for v in ltr_age.values() if len(v) > 100)
+            total_elems  = sum(len(v) for v in ltr_age.values())
+            print(f"\n[2c] LTR age file: {total_elems:,} elements across "
+                  f"{len(ltr_age)} families "
+                  f"({n_qualifying} with >100 elements) — {args.ltr_age}")
+        except Exception as e:
+            print(f"\n[2c] WARNING: could not read LTR age file ({e}); skipping")
 
     # ── optional CRM file for centromere approximation ───────────────────────
     crm_intervals = None
@@ -3571,9 +3992,10 @@ def main():
         print("    Page 5b: insertion cluster frequency spectrum")
         build_page_insertion_spectrum(pdf, pos_df)
         if args.gff:
-            print("    Page 6: gene-context disruptions, metagene & enrichment")
+            print("    Page 6: gene-context enrichment, metagene & K2P age")
             build_page_gene_context(pdf, merged, pos_df, args.gff,
-                                    fai_lengths=fai_lengths)
+                                    fai_lengths=fai_lengths,
+                                    ltr_age=ltr_age)
 
         print("    Final page: command reproducibility")
         build_page_command(pdf)
