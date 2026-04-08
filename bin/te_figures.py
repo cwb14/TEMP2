@@ -3839,6 +3839,67 @@ def main():
     n_fam   = sum(1 for c in merged.columns if c.startswith("te_fam_"))
     print(f"    te_fam_* (superfamily) cols: {n_fam}  te_clade_* (family) cols: {n_clade}")
 
+    # ── General summary statistics ───────────────────────────────────────────
+    print(f"\n{'─'*65}")
+    print(f"  SUMMARY STATISTICS")
+    print(f"{'─'*65}")
+    te_counts = merged["n_te_total"]
+    total_ins = int(te_counts.sum())
+    print(f"  Samples analysed:       {len(merged)}")
+    print(f"  Total TE insertions:    {total_ins:,}")
+    print(f"  Mean per sample:        {te_counts.mean():,.1f}")
+    print(f"  Median per sample:      {te_counts.median():,.1f}")
+    print(f"  Std dev:                {te_counts.std():,.1f}")
+    print(f"  Min:                    {int(te_counts.min()):,}  "
+          f"({te_counts.idxmin()})")
+    print(f"  Max:                    {int(te_counts.max()):,}  "
+          f"({te_counts.idxmax()})")
+    cv = te_counts.std() / te_counts.mean() * 100 if te_counts.mean() > 0 else 0
+    print(f"  CV:                     {cv:.1f}%")
+
+    if "te_freq_mean" in merged.columns:
+        freq = merged["te_freq_mean"].dropna()
+        if len(freq) > 0:
+            print(f"\n  Mean insertion freq:    {freq.mean():.3f}  "
+                  f"(across sample means)")
+    if "te_support_reads_mean" in merged.columns:
+        sr = merged["te_support_reads_mean"].dropna()
+        if len(sr) > 0:
+            print(f"  Mean support reads:    {sr.mean():.1f}  "
+                  f"(across sample means)")
+
+    # Top superfamilies
+    fam_cols = [c for c in merged.columns if c.startswith("te_fam_")]
+    if fam_cols:
+        fam_means = merged[fam_cols].mean().sort_values(ascending=False)
+        fam_total = fam_means.sum()
+        print(f"\n  Top superfamilies (mean insertions/sample):")
+        for col, val in fam_means.head(10).items():
+            name = col.replace("te_fam_", "")
+            pct = val / fam_total * 100 if fam_total > 0 else 0
+            present = (merged[col] > 0).sum()
+            print(f"    {name:<20} {val:>7.1f}  ({pct:>5.1f}%)  "
+                  f"in {present}/{len(merged)} samples")
+
+    # Top LTR-RT families
+    clade_cols = [c for c in merged.columns if c.startswith("te_clade_")]
+    if clade_cols:
+        clade_means = merged[clade_cols].mean().sort_values(ascending=False)
+        clade_total = clade_means.sum()
+        print(f"\n  Top LTR-RT families (mean insertions/sample):")
+        for col, val in clade_means.head(10).items():
+            name = col.replace("te_clade_", "")
+            pct = val / clade_total * 100 if clade_total > 0 else 0
+            present = (merged[col] > 0).sum()
+            print(f"    {name:<20} {val:>7.1f}  ({pct:>5.1f}%)  "
+                  f"in {present}/{len(merged)} samples")
+
+    # Quartile distribution
+    q25, q75 = te_counts.quantile(0.25), te_counts.quantile(0.75)
+    print(f"\n  Quartiles:  Q1={q25:,.0f}  Q2={te_counts.median():,.0f}  Q3={q75:,.0f}  "
+          f"IQR={q75-q25:,.0f}")
+    print(f"{'─'*65}")
+
     # ── optional LTR-RT age file ─────────────────────────────────────────────
     ltr_age = None
     if args.ltr_age:
