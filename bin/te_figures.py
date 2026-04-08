@@ -18,6 +18,8 @@ Five-page multi-panel PDF from TEMP2 TE insertion BED files + master TSV.
   Page 4  Per-sample stacked bar by superfamily    (full width)
   Page 5  Per-sample stacked bar by LTR-RT family (full width)
 
+Note: Superfamily names Copia/Gypsy are renamed to Ty1/Ty3 throughout.
+
 Recommended command for marestail dataset:
     conda run -n bioinfo python te_figures.py \\
         --master MASTER_MARESTAIL_MERGED_less_China_Mar2026.tsv \\
@@ -39,6 +41,13 @@ General usage:
         [--awk '$5 >= 0.1 && $8 >= 3 && $7 == "1p1"'] \\
         [--fai ref.fa.fai] \\
         [--sample-col Sample]
+
+    python te_figures.py --master MASTER_MARESTAIL_MERGED_less_China_Mar2026_fixed.tsv \
+        --te-pattern '{sample}_TEMP2/{sample}.insertion.fam.bed' \
+        --output te_analysis_report.pdf \
+        --awk '$5 >= 0.1 && $8 >= 3 && ($7 == "1p1" || $7 == "2p")' \
+        --fai ref.fa.fai --gff GCF_010389155.1_C_canadensis_v1_genomic.gff \
+        --crm CRM2.txt --ltr-age ref_latest_040826_all_kmer2ltr_dedup2
 """
 
 import argparse
@@ -93,6 +102,36 @@ PALETTE = [
     "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD",
     "#E377C2", "#BCBD22", "#17BECF", "#AEC6CF", "#FFB347",
 ]
+
+# ── Superfamily renaming (politically neutral nomenclature) ──────────────
+# Applied at every data-entry point so all downstream code sees Ty1/Ty3.
+SUPERFAMILY_RENAME = {"Copia": "Ty1", "Gypsy": "Ty3"}
+
+def _rename_superfamily(name):
+    """Rename Gypsy→Ty3, Copia→Ty1; pass through everything else."""
+    return SUPERFAMILY_RENAME.get(name, name)
+
+# Global mapping: LTR-RT family → superfamily (populated during data loading).
+# e.g. {"SIRE": "Ty1", "Tekay": "Ty3", ...}
+FAMILY_TO_SUPERFAMILY = {}
+
+# Colors used to tint LTR-RT family tick-label text by superfamily.
+SUPERFAMILY_LABEL_COLORS = {"Ty1": "#1B7837", "Ty3": "#762A83"}  # green / purple
+
+# Families too ambiguous to assign a superfamily color.
+_AMBIGUOUS_FAMILIES = {"unknown", "mixture"}
+
+def _color_clade_ticklabels(ax, axis="x"):
+    """Recolor tick labels on an axis by LTR-RT superfamily membership.
+    Skips ambiguous families (unknown, mixture)."""
+    ticks = ax.get_xticklabels() if axis == "x" else ax.get_yticklabels()
+    for lbl in ticks:
+        name = lbl.get_text()
+        if name in _AMBIGUOUS_FAMILIES:
+            continue
+        sup = FAMILY_TO_SUPERFAMILY.get(name)
+        if sup and sup in SUPERFAMILY_LABEL_COLORS:
+            lbl.set_color(SUPERFAMILY_LABEL_COLORS[sup])
 
 # Per-category palettes — no shared colors between superfamily and family sets.
 #
@@ -360,8 +399,9 @@ def parse_te_levels(te_id):
     """
     Parse TE_ID field.  Returns list of level tuples (order, superfamily, family) where:
       order       = parts[0]  (LTR, DNA, LINE …)                top-level order
-      superfamily = parts[1]  (Copia, Gypsy, hAT, Helitron …)  superfamily level
+      superfamily = parts[1]  (Ty1, Ty3, hAT, Helitron …)      superfamily level
       family      = parts[-1] (SIRE, TAR, Ale, Helitron, DTH …) family level
+    Superfamily names are mapped through SUPERFAMILY_RENAME (Copia→Ty1, Gypsy→Ty3).
     """
     if not isinstance(te_id, str):
         return []
@@ -371,8 +411,11 @@ def parse_te_levels(te_id):
         if m:
             lvls  = m.group(1).split("/")
             order = lvls[0]
-            fam   = lvls[1] if len(lvls) >= 2 else lvls[0]
+            fam   = _rename_superfamily(lvls[1] if len(lvls) >= 2 else lvls[0])
             clade = lvls[-1]   # most specific available level
+            # Record family→superfamily mapping for LTR-RTs
+            if order == "LTR" and clade != fam:
+                FAMILY_TO_SUPERFAMILY.setdefault(clade, fam)
             results.append((order, fam, clade))
     return results
 
@@ -931,8 +974,14 @@ def describe_cluster_tes(chrom, pos, pos_df, window=50):
             if m:
                 counts[m.group(1)] += 1   # e.g. "LTR/Copia/SIRE"
 
+    # Rename Gypsy/Copia → Ty3/Ty1 in displayed taxonomy strings
+    renamed = {}
+    for tax, cnt in counts.items():
+        for old, new in SUPERFAMILY_RENAME.items():
+            tax = tax.replace(f"/{old}/", f"/{new}/").replace(f"/{old}", f"/{new}")
+        renamed[tax] = cnt
     return [f"{taxonomy}  (n={cnt})"
-            for taxonomy, cnt in counts.most_common()]
+            for taxonomy, cnt in sorted(renamed.items(), key=lambda x: -x[1])]
 
 
 def annotate_insertion(chrom, pos, genes_df, upstream_bp=1000):
@@ -1185,6 +1234,8 @@ def panel_bar(ax, merged, col_prefix, title, panel_letter, top_n=12):
             clip_on=False)
     ax.grid(axis="x", alpha=0.25)
     ax.grid(axis="y", alpha=0)
+    if "clade" in col_prefix:
+        _color_clade_ticklabels(ax, axis="y")
 
 
 def panel_boxplot(ax, merged, cat_col, title, panel_letter, label_map=None,
@@ -1439,6 +1490,8 @@ def panel_gly_violin(ax, merged, gly_col, col_prefix, title, panel_letter,
     cat_labels = [fc.replace(col_prefix, "") for fc in top_cols]
     ax.set_xticks(np.arange(n_cats))
     ax.set_xticklabels(cat_labels, fontsize=7.5, rotation=30, ha="right")
+    if "clade" in col_prefix:
+        _color_clade_ticklabels(ax, axis="x")
     ax.set_xlabel(x_label)
 
     if y_transform == "log10p1":
@@ -1629,8 +1682,15 @@ def panel_sample_stacked(ax, merged, col_prefix="te_fam_", top_n=10,
         ax.text(-0.06, panel_letter_y, panel_letter, transform=ax.transAxes,
                 fontsize=11, fontweight="bold", va="bottom", ha="right",
                 clip_on=False)
-    ax.legend(title=group_name, fontsize=6.5, title_fontsize=7,
-              loc="lower right", ncol=2)
+    leg = ax.legend(title=group_name, fontsize=6.5, title_fontsize=7,
+                    loc="lower right", ncol=2)
+    if "clade" in col_prefix:
+        for txt in leg.get_texts():
+            name = txt.get_text()
+            if name not in _AMBIGUOUS_FAMILIES:
+                sup = FAMILY_TO_SUPERFAMILY.get(name)
+                if sup and sup in SUPERFAMILY_LABEL_COLORS:
+                    txt.set_color(SUPERFAMILY_LABEL_COLORS[sup])
     ax.grid(axis="x", alpha=0.22)
     ax.grid(axis="y", alpha=0)
 
@@ -2006,6 +2066,7 @@ def panel_context_enrichment(ax, comp_df, panel_letter, top_n=10, label=None,
     ax.set_xticks(np.arange(len(top_cols)))
     if show_xticklabels:
         ax.set_xticklabels(top_cols, fontsize=6.5, rotation=35, ha="right")
+        _color_clade_ticklabels(ax, axis="x")
     else:
         ax.set_xticklabels([])
     ax.set_yticks(np.arange(len(CONTEXTS)))
@@ -2132,6 +2193,7 @@ def panel_context_prop_violin(ax, long_df, panel_letter, top_n=10, label=None,
     ax.set_xticks(np.arange(n_cats))
     if show_xticklabels:
         ax.set_xticklabels(top_cats, fontsize=6.5, rotation=35, ha="right")
+        _color_clade_ticklabels(ax, axis="x")
     else:
         ax.set_xticklabels([])
     ax.set_ylabel("Context Proportion\n(normalized density)" if context_lengths_kb
@@ -2310,6 +2372,81 @@ def build_page1(pdf, merged):
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+    # ── Page 1 summary statistics ────────────────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 1 — Composition & Comparisons")
+    print(f"    {'─'*_W}")
+    # Panel A: Superfamily bar
+    fam_cols = get_te_cols(merged, "te_fam_")
+    if fam_cols:
+        fam_means = merged[fam_cols].mean().sort_values(ascending=False)
+        fam_total = fam_means.sum()
+        print(f"    Panel A — TE Superfamily composition (n={len(merged)} samples)")
+        print(f"      Total mean insertions/sample: {fam_total:.1f}")
+        for col, val in fam_means.items():
+            name = col.replace("te_fam_", "")
+            pct = val / fam_total * 100 if fam_total > 0 else 0
+            med = merged[col].median()
+            sd  = merged[col].std()
+            present = (merged[col] > 0).sum()
+            print(f"      {name:<18} mean={val:>7.1f} ± {sd:.1f}  "
+                  f"med={med:.0f}  ({pct:>5.1f}%)  "
+                  f"present in {present}/{len(merged)} ({present/len(merged)*100:.0f}%)")
+    # Panel B: LTR-RT family bar
+    clade_cols = get_te_cols(merged, "te_clade_")
+    if clade_cols:
+        clade_means = merged[clade_cols].mean().sort_values(ascending=False)
+        clade_total = clade_means.sum()
+        print(f"    Panel B — LTR-RT Family composition")
+        print(f"      Total mean LTR-RT insertions/sample: {clade_total:.1f}")
+        print(f"      LTR-RT fraction of total: "
+              f"{clade_total/fam_total*100:.1f}%" if fam_total > 0 else "      N/A")
+        for col, val in clade_means.items():
+            name = col.replace("te_clade_", "")
+            pct = val / clade_total * 100 if clade_total > 0 else 0
+            med = merged[col].median()
+            sd  = merged[col].std()
+            sup = FAMILY_TO_SUPERFAMILY.get(name, "?")
+            present = (merged[col] > 0).sum()
+            print(f"      {name:<18} [{sup:<3}] mean={val:>7.1f} ± {sd:.1f}  "
+                  f"med={med:.0f}  ({pct:>5.1f}%)  "
+                  f"in {present}/{len(merged)}")
+    # Panel C: Region boxplot
+    if "Region_new" in merged.columns:
+        print(f"    Panel C — TE insertions by region")
+        reg_grp = merged.groupby("Region_new")["n_te_total"]
+        for reg, sub in reg_grp:
+            print(f"      {str(reg):<22} n={len(sub):<4} mean={sub.mean():.1f}  "
+                  f"med={sub.median():.0f}  sd={sub.std():.1f}  "
+                  f"range=[{sub.min():.0f}–{sub.max():.0f}]")
+        H, p = safe_kruskal(merged["n_te_total"], merged["Region_new"])
+        if not np.isnan(p):
+            print(f"      Kruskal–Wallis H={H:.2f}, p={p:.2e}")
+    # Panel D: Glyphosate boxplot
+    for gc in ["Glyphosate_R", "glyphosate_res"]:
+        if gc in merged.columns:
+            gly = merged[[gc, "n_te_total"]].dropna()
+            gly[gc] = gly[gc].astype(str).str.strip()
+            gly = gly[gly[gc].isin(["0", "0.0", "1", "1.0"])]
+            gly["group"] = gly[gc].map({"0": "Susceptible", "0.0": "Susceptible",
+                                         "1": "Resistant", "1.0": "Resistant"})
+            print(f"    Panel D — TE insertions by glyphosate resistance")
+            for grp, sub in gly.groupby("group")["n_te_total"]:
+                print(f"      {grp:<14} n={len(sub):<4} mean={sub.mean():.1f}  "
+                      f"med={sub.median():.0f}  sd={sub.std():.1f}  "
+                      f"range=[{sub.min():.0f}–{sub.max():.0f}]")
+            s = gly.loc[gly["group"] == "Susceptible", "n_te_total"]
+            r = gly.loc[gly["group"] == "Resistant", "n_te_total"]
+            if len(s) >= 3 and len(r) >= 3:
+                U, p = stats.mannwhitneyu(s, r, alternative="two-sided")
+                print(f"      Mann–Whitney U={U:.0f}, p={p:.2e}")
+                # Effect size: rank-biserial correlation
+                rbc = 1 - (2*U) / (len(s) * len(r))
+                print(f"      Rank-biserial r={rbc:.3f}")
+            break
+    print(f"    {'─'*_W}")
+
 
 def build_page2(pdf, merged):
     """Page 2: three regression panels — top-3 variables by R² vs n_te_total."""
@@ -2358,6 +2495,36 @@ def build_page2(pdf, merged):
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+    # ── Page 2 summary statistics ────────────────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 2 — Regressions (top {len(top6)} by R²)")
+    print(f"    {'─'*_W}")
+    for idx, (var, r2_val) in enumerate(top6):
+        x = _col(var)
+        xc, yc, n_excl = drop_outliers_iqr(x, y)
+        rho, pval = safe_corr(xc, yc, "spearman")
+        desc = BIO_KEY.get(var, var)
+        slope = np.nan
+        try:
+            m, b = np.polyfit(xc, yc, 1)
+            slope = m
+        except Exception:
+            pass
+        print(f"    Panel {chr(65+idx)} — {var}: {desc}")
+        print(f"      n={len(xc)}, excluded outliers={n_excl}")
+        print(f"      R²={r2_val:.4f}  Spearman ρ={rho:.4f}  p={pval:.2e}")
+        if not np.isnan(slope):
+            print(f"      OLS slope={slope:.4f}  intercept={b:.2f}")
+        print(f"      x: mean={xc.mean():.2f}  range=[{xc.min():.2f}–{xc.max():.2f}]")
+        print(f"      y: mean={yc.mean():.1f}  range=[{yc.min():.0f}–{yc.max():.0f}]")
+    # Also report all tested variables ranked
+    print(f"    All tested variables ranked by R²:")
+    for v, r in r2_scores[:20]:
+        desc = BIO_KEY.get(v, v)
+        print(f"      {v:<20} R²={r:.4f}  ({desc})")
+    print(f"    {'─'*_W}")
+
 
 def build_page3(pdf, merged):
     """
@@ -2401,6 +2568,54 @@ def build_page3(pdf, merged):
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+    # ── Page 3 summary statistics ────────────────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 3 — Glyphosate × TE & BioClim Correlations")
+    print(f"    {'─'*_W}")
+    if gly_col and gly_col in merged.columns:
+        gly = merged[gly_col].astype(str).str.strip().map(
+            {"0": "S", "1": "R", "0.0": "S", "1.0": "R"})
+        for prefix, label in [("te_fam_", "Superfamily"), ("te_clade_", "LTR-RT Family")]:
+            cols = get_te_cols(merged, prefix)
+            top_cols = merged[cols].mean().sort_values(ascending=False).head(10).index.tolist()
+            print(f"    Panels A/B — {label} × Glyphosate (Mann–Whitney U, Bonferroni)")
+            n_tests = 0
+            sig_results = []
+            for fc in top_cols:
+                name = fc.replace(prefix, "")
+                s_d = merged.loc[gly == "S", fc].dropna()
+                r_d = merged.loc[gly == "R", fc].dropna()
+                if len(s_d) >= 3 and len(r_d) >= 3:
+                    n_tests += 1
+                    U, p = stats.mannwhitneyu(s_d, r_d, alternative="two-sided")
+                    fc_val = np.log2((r_d.mean()+0.5) / (s_d.mean()+0.5))
+                    sig_results.append((name, s_d.mean(), r_d.mean(), fc_val, p))
+            for name, s_m, r_m, fc_val, p in sig_results:
+                padj = min(p * n_tests, 1.0)
+                sig = "***" if padj<0.001 else "**" if padj<0.01 else "*" if padj<0.05 else "ns"
+                print(f"      {name:<18} S={s_m:>6.1f}  R={r_m:>6.1f}  "
+                      f"log2FC={fc_val:>+.2f}  padj={padj:.2e} {sig}")
+    # Panel C: BioClim correlations
+    bio_cols = [f"Bio{i:02d}" for i in range(1, 41)]
+    te_total = pd.to_numeric(merged["n_te_total"], errors="coerce")
+    print(f"    Panel C — BioClim Spearman correlations (Bonferroni)")
+    bio_results = []
+    for bc in bio_cols:
+        if bc in merged.columns:
+            x = pd.to_numeric(merged[bc], errors="coerce")
+            rho, pval = safe_corr(x, te_total, "spearman")
+            if not np.isnan(rho):
+                bio_results.append((bc, rho, pval))
+    n_bio = len(bio_results)
+    bio_results.sort(key=lambda x: abs(x[1]), reverse=True)
+    for bc, rho, pval in bio_results[:15]:
+        padj = min(pval * n_bio, 1.0)
+        sig = "***" if padj<0.001 else "**" if padj<0.01 else "*" if padj<0.05 else "ns"
+        desc = BIO_KEY.get(bc, bc)
+        print(f"      {bc:<8} ρ={rho:>+.3f}  padj={padj:.2e} {sig}  ({desc})")
+    print(f"    {'─'*_W}")
+
 
 def build_page4(pdf, merged):
     """
@@ -2425,6 +2640,46 @@ def build_page4(pdf, merged):
 
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+    # ── Page 4 summary statistics ────────────────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 4 — Per-sample Stacked Bars")
+    print(f"    {'─'*_W}")
+    te_total = merged["n_te_total"]
+    print(f"    Samples: {len(merged)}")
+    print(f"    Total TE insertions range: {int(te_total.min()):,}–{int(te_total.max()):,}")
+    # Diversity per sample (Shannon index across superfamilies)
+    fam_cols = get_te_cols(merged, "te_fam_")
+    if fam_cols:
+        fam_mat = merged[fam_cols].fillna(0)
+        totals = fam_mat.sum(axis=1).replace(0, 1)
+        props = fam_mat.div(totals, axis=0)
+        log_props = np.log(props.replace(0, 1))
+        shannon = -(props * log_props).sum(axis=1)
+        print(f"    Superfamily Shannon diversity: mean={shannon.mean():.3f}  "
+              f"sd={shannon.std():.3f}  range=[{shannon.min():.3f}–{shannon.max():.3f}]")
+    # Glyphosate resistance info
+    gly_res = pd.Series(False, index=merged.index)
+    for gc in ["Glyphosate_R", "glyphosate_res"]:
+        if gc in merged.columns:
+            gly_res |= (merged[gc].astype(str).str.strip()
+                        .isin(["1", "1.0", "R", "Resistant"]))
+    n_r = gly_res.sum()
+    print(f"    Resistant samples (pink): {n_r}/{len(merged)}")
+    if n_r > 0:
+        r_mean = te_total[gly_res].mean()
+        s_mean = te_total[~gly_res].mean()
+        print(f"    Mean TE insertions — R: {r_mean:.1f}  S: {s_mean:.1f}  "
+              f"diff: {r_mean - s_mean:+.1f}")
+    # Dominant superfamily per sample
+    if fam_cols:
+        dom = fam_mat.idxmax(axis=1).str.replace("te_fam_", "")
+        dom_counts = dom.value_counts()
+        print(f"    Dominant superfamily per sample:")
+        for name, cnt in dom_counts.items():
+            print(f"      {name:<18} {cnt} samples ({cnt/len(merged)*100:.0f}%)")
+    print(f"    {'─'*_W}")
 
 
 def build_sample_presence_matrix(pos_df, window=5):
@@ -2970,6 +3225,13 @@ def build_page_insertion_spectrum(pdf, pos_df):
             for _, row in df.iterrows()
         ]
         ax.set_yticklabels(ylabels, fontsize=7)
+        # Color y-tick labels by superfamily for LTR-RT families
+        for lbl in ax.get_yticklabels():
+            fam_name = lbl.get_text().split("  (n=")[0]
+            if fam_name not in _AMBIGUOUS_FAMILIES:
+                sup = FAMILY_TO_SUPERFAMILY.get(fam_name)
+                if sup and sup in SUPERFAMILY_LABEL_COLORS:
+                    lbl.set_color(SUPERFAMILY_LABEL_COLORS[sup])
         ax.set_xlabel("Singleton rate  (observed / expected)", fontsize=8)
 
         xabs = (df["ratio"] - 1.0).abs().max()
@@ -3030,6 +3292,34 @@ def build_page_insertion_spectrum(pdf, pos_df):
 
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+    # ── Insertion spectrum summary statistics ─────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 5b — Insertion Cluster Frequency Spectrum")
+    print(f"    {'─'*_W}")
+    print(f"    Total clusters: {n_total:,}")
+    print(f"    Singletons (1 sample): {n_sing:,} ({100*n_sing/n_total:.1f}%)")
+    print(f"    Shared (≥2 samples):   {n_shared:,} ({100*n_shared/n_total:.1f}%)")
+    # Sharing distribution
+    spec_sorted = sorted(overall_spec.items())
+    for k, v in spec_sorted:
+        if k <= 10 or v >= 10:
+            print(f"      {k:>3} samples: {v:>6,} clusters ({100*v/n_total:.1f}%)")
+    max_sharing = max(overall_spec.keys())
+    print(f"    Max sharing: {max_sharing} samples")
+    mean_sharing = np.mean(overall_counts)
+    print(f"    Mean cluster size: {mean_sharing:.2f} samples")
+    # Singleton enrichment highlights
+    for label, df_stats in [("Superfamily", df_sup), ("LTR-RT Family", df_fam)]:
+        if not df_stats.empty:
+            sig = df_stats[df_stats["fdr"] < 0.05]
+            print(f"    {label} singleton enrichment (FDR<0.05): {len(sig)} significant")
+            for _, row in sig.iterrows():
+                direction = "enriched" if row["ratio"] > 1 else "depleted"
+                print(f"      {row['label']:<18} ratio={row['ratio']:.2f}  "
+                      f"FDR={row['fdr']:.3e}  ({direction})")
+    print(f"    {'─'*_W}")
 
 
 def build_page_kary_sharing(pdf, clusters_df, pos_df,
@@ -3237,6 +3527,40 @@ def build_page_kary_sharing(pdf, clusters_df, pos_df,
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+    # ── Karyotype + sharing summary statistics ───────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 5 — Karyotype & Sample TE Sharing")
+    print(f"    {'─'*_W}")
+    if not clusters_df.empty:
+        n_sig = int((clusters_df["padj"] < 0.05).sum())
+        n_R_e = int((clusters_df["enrichment"] == "R").sum())
+        n_S_e = int((clusters_df["enrichment"] == "S").sum())
+        n_ns  = int((clusters_df["enrichment"] == "ns").sum())
+        print(f"    Panel A — Karyotype enrichment")
+        print(f"      Total clusters tested: {len(clusters_df):,}")
+        print(f"      Significant (padj<0.05): {n_sig}")
+        print(f"      R-enriched: {n_R_e}  S-enriched: {n_S_e}  n.s.: {n_ns}")
+        if n_sig > 0:
+            sig = clusters_df[clusters_df["padj"] < 0.05]
+            chr_dist = sig["Chr"].value_counts()
+            print(f"      Significant loci per chromosome:")
+            for ch, cnt in chr_dist.items():
+                print(f"        {ch}: {cnt}")
+    if has_sharing:
+        print(f"    Panel B — Jaccard similarity heatmap")
+        print(f"      Samples: {n}")
+        print(f"      Insertion loci: {n_loci:,}")
+        jac_vals = dist_vec  # Jaccard distances
+        sim_vals = 1.0 - jac_vals
+        print(f"      Jaccard similarity: mean={sim_vals.mean():.4f}  "
+              f"med={np.median(sim_vals):.4f}  "
+              f"range=[{sim_vals.min():.4f}–{sim_vals.max():.4f}]")
+        # Region clustering info
+        if unique_regions:
+            print(f"      Regions: {', '.join(unique_regions)}")
+    print(f"    {'─'*_W}")
+
 
 def build_page6(pdf, clusters_df, pos_df, fai_lengths=None, crm_intervals=None):
     """Page 6: linear karyotype with R/S-enriched insertion positions."""
@@ -3363,7 +3687,12 @@ def panel_intergenic_regression(ax, clade_comp_df, merged, top_clades,
 
     # Label each family point
     for xi, yi, fam in zip(x_vals, y_vals, families):
-        ax.annotate(fam, (xi, yi), fontsize=5.5, color="#333333",
+        if fam in _AMBIGUOUS_FAMILIES:
+            fam_color = "#333333"
+        else:
+            sup = FAMILY_TO_SUPERFAMILY.get(fam)
+            fam_color = SUPERFAMILY_LABEL_COLORS.get(sup, "#333333")
+        ax.annotate(fam, (xi, yi), fontsize=5.5, color=fam_color,
                     xytext=(3, 3), textcoords="offset points")
 
 
@@ -3443,7 +3772,12 @@ def panel_ref_count_regression(ax, merged, ltr_age, top_clades, panel_letter=Non
                 clip_on=False)
 
     for xi, yi, fam in zip(x_vals, y_vals, families):
-        ax.annotate(fam, (xi, yi), fontsize=5.5, color="#333333",
+        if fam in _AMBIGUOUS_FAMILIES:
+            fam_color = "#333333"
+        else:
+            sup = FAMILY_TO_SUPERFAMILY.get(fam)
+            fam_color = SUPERFAMILY_LABEL_COLORS.get(sup, "#333333")
+        ax.annotate(fam, (xi, yi), fontsize=5.5, color=fam_color,
                     xytext=(3, 3), textcoords="offset points")
 
 
@@ -3575,9 +3909,11 @@ def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E"):
                     bbox=dict(boxstyle="round,pad=0.15", fc="white",
                               ec="none", alpha=0.75))
 
+        fam_sup = FAMILY_TO_SUPERFAMILY.get(family) if family not in _AMBIGUOUS_FAMILIES else None
+        fam_text_color = SUPERFAMILY_LABEL_COLORS.get(fam_sup, "#222222")
         ax.text(0.98, 0.97, f"{family}  (n={len(values):,})",
                 transform=ax.transAxes, fontsize=6,
-                ha="right", va="top",
+                ha="right", va="top", color=fam_text_color,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
                           ec="none", alpha=0.80))
 
@@ -3750,6 +4086,82 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None,
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+    # ── Gene-context page summary statistics ─────────────────────────────────
+    _W = 72
+    print(f"\n    {'─'*_W}")
+    print(f"    PAGE 6 — Gene Context, Metagene & LTR-RT Age")
+    print(f"    {'─'*_W}")
+    print(f"    Genes: {n_genes:,}  Exon-annotated: {len(exon_intervals):,}")
+    # Context composition totals
+    if not fam_comp_df.empty:
+        ctx_totals = fam_comp_df.sum(axis=1)
+        total_ins = ctx_totals.sum()
+        print(f"    TE context distribution (all superfamilies, n={int(total_ins):,}):")
+        for ctx in CONTEXT_ORDER:
+            if ctx in ctx_totals.index:
+                n = int(ctx_totals[ctx])
+                pct = n / total_ins * 100 if total_ins > 0 else 0
+                print(f"      {ctx:<22} {n:>8,}  ({pct:.1f}%)")
+    # Length-normalised densities
+    if ctx_lengths_kb:
+        print(f"    Context lengths (kb) and insertion density:")
+        for ctx in CONTEXT_ORDER:
+            if ctx in ctx_totals.index and ctx in ctx_lengths_kb:
+                length_kb = ctx_lengths_kb[ctx]
+                density = ctx_totals[ctx] / length_kb if length_kb > 0 else 0
+                print(f"      {ctx:<22} {length_kb:>10,.1f} kb  "
+                      f"density={density:.3f} ins/kb")
+    # LTR-RT family context enrichment highlights
+    if not clade_comp_df.empty:
+        print(f"    LTR-RT family context enrichment (top families):")
+        intergenic_fc = compute_intergenic_log2fc(clade_comp_df, top_clades,
+                                                   ctx_lengths_kb)
+        if not intergenic_fc.empty:
+            for fam in top_clades:
+                if fam in intergenic_fc.index:
+                    fc = intergenic_fc[fam]
+                    sup = FAMILY_TO_SUPERFAMILY.get(fam, "?")
+                    print(f"      {fam:<18} [{sup:<3}] intergenic log2FC={fc:>+.2f}")
+    # Gene disruptions (per-sample exonic + intronic counts)
+    if not disruption_df.empty:
+        n_exonic_total = disruption_df["n_exonic"].sum()
+        n_intronic_total = disruption_df["n_intronic"].sum()
+        mean_exonic = disruption_df["n_exonic"].mean()
+        mean_intronic = disruption_df["n_intronic"].mean()
+        print(f"    Gene disruptions (per-sample counts):")
+        print(f"      Exonic:   total={int(n_exonic_total):,}  "
+              f"mean/sample={mean_exonic:.1f}  "
+              f"range=[{int(disruption_df['n_exonic'].min())}–"
+              f"{int(disruption_df['n_exonic'].max())}]")
+        print(f"      Intronic: total={int(n_intronic_total):,}  "
+              f"mean/sample={mean_intronic:.1f}  "
+              f"range=[{int(disruption_df['n_intronic'].min())}–"
+              f"{int(disruption_df['n_intronic'].max())}]")
+    # K2P age summary
+    if ltr_age:
+        print(f"    LTR-RT K2P age summary:")
+        for fam in LTR_AGE_FAMILY_ORDER:
+            if fam in ltr_age:
+                vals = np.array(ltr_age[fam], dtype=float)
+                vals_c = vals[vals <= 0.15]
+                sup = FAMILY_TO_SUPERFAMILY.get(fam, "?")
+                if len(vals_c) >= 5:
+                    from scipy.stats import gaussian_kde
+                    try:
+                        kde_fn = gaussian_kde(vals_c, bw_method="scott")
+                        eval_pts = np.linspace(0, 0.15, 1000)
+                        peak = eval_pts[np.argmax(kde_fn(eval_pts))]
+                    except Exception:
+                        peak = np.nan
+                else:
+                    peak = np.nan
+                print(f"      {fam:<18} [{sup:<3}] n={len(vals):>6,}  "
+                      f"mean={vals_c.mean():.4f}  med={np.median(vals_c):.4f}  "
+                      f"peak={peak:.4f}" if not np.isnan(peak) else
+                      f"      {fam:<18} [{sup:<3}] n={len(vals):>6,}  "
+                      f"mean={vals_c.mean():.4f}  med={np.median(vals_c):.4f}")
+    print(f"    {'─'*_W}")
+
 
 def build_page_command(pdf):
     """Final page: record the exact command line for reproducibility."""
@@ -3891,8 +4303,17 @@ def main():
             name = col.replace("te_clade_", "")
             pct = val / clade_total * 100 if clade_total > 0 else 0
             present = (merged[col] > 0).sum()
-            print(f"    {name:<20} {val:>7.1f}  ({pct:>5.1f}%)  "
+            sup = FAMILY_TO_SUPERFAMILY.get(name, "?")
+            print(f"    {name:<20} [{sup:<3}] {val:>7.1f}  ({pct:>5.1f}%)  "
                   f"in {present}/{len(merged)} samples")
+
+    # Family→superfamily mapping summary
+    if FAMILY_TO_SUPERFAMILY:
+        ty1_fams = sorted(k for k, v in FAMILY_TO_SUPERFAMILY.items() if v == "Ty1")
+        ty3_fams = sorted(k for k, v in FAMILY_TO_SUPERFAMILY.items() if v == "Ty3")
+        print(f"\n  LTR-RT family→superfamily mapping:")
+        print(f"    Ty1 (ex-Copia): {', '.join(ty1_fams)}")
+        print(f"    Ty3 (ex-Gypsy): {', '.join(ty3_fams)}")
 
     # Quartile distribution
     q25, q75 = te_counts.quantile(0.25), te_counts.quantile(0.75)
