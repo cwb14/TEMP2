@@ -7,6 +7,7 @@ https://cdn.elifesciences.org/articles/15716/elife-15716-v2.pdf # 2835 non-refer
 https://www.nature.com/articles/s41467-020-17874-2.pdf # 6906
 https://link.springer.com/article/10.1186/s12864-017-4103-x # 274,408
 https://academic.oup.com/nsr/article/11/6/nwae188/7687832?guestAccessKey=
+https://doi.org/10.1038/s41467-025-62887-4
 
 TE Insertion Analysis – Publication Figure Generator
 ====================================================
