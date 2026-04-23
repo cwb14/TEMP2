@@ -42,13 +42,6 @@ General usage:
         [--awk '$5 >= 0.1 && $8 >= 3 && $7 == "1p1"'] \\
         [--fai ref.fa.fai] \\
         [--sample-col Sample]
-
-    python te_figures.py --master MASTER_MARESTAIL_MERGED_less_China_Mar2026_fixed.tsv \
-        --te-pattern '{sample}_TEMP2/{sample}.insertion.fam.bed' \
-        --output te_analysis_report.pdf \
-        --awk '$5 >= 0.1 && $8 >= 3 && ($7 == "1p1" || $7 == "2p")' \
-        --fai ref.fa.fai --gff GCF_010389155.1_C_canadensis_v1_genomic.gff \
-        --crm CRM2.txt --ltr-age ref_latest_040826_all_kmer2ltr_dedup2
 """
 
 import argparse
@@ -59,6 +52,7 @@ import subprocess
 import sys
 import warnings
 from collections import Counter
+from urllib.parse import unquote
 
 import matplotlib
 matplotlib.use("Agg")
@@ -277,6 +271,15 @@ def parse_args():
                         "col11=K2P divergence between the two LTRs). Families "
                         "with >100 elements are plotted as stacked K2P density "
                         "histograms on the gene-context page (requires --gff).")
+    p.add_argument("--mutation-rate", default=None, type=float, dest="mutation_rate",
+                   help="Per-site per-year mutation rate (e.g. 1.3e-8). When "
+                        "provided with --ltr-age, peak insertion times (Mya) "
+                        "are shown alongside K2P divergence on Panel F. "
+                        "T = K2P / (2 × μ).")
+    p.add_argument("--repeatmasker-tbl", default=None, dest="repeatmasker_tbl",
+                   help="RepeatMasker .tbl summary for the reference genome. "
+                        "When supplied, an appendix page is added with the "
+                        "reference repeat composition (zero-count rows omitted).")
     return p.parse_args()
 
 
@@ -1295,9 +1298,21 @@ def panel_boxplot(ax, merged, cat_col, title, panel_letter, label_map=None,
     ax.set_xlabel("Total TE Insertions")
     if ylabel:
         ax.set_ylabel(ylabel)
-    H, p = safe_kruskal(sub["n_te_total"], sub[cat_col])
+    n_groups = sub[cat_col].nunique()
+    if n_groups == 2:
+        groups = [sub.loc[sub[cat_col] == g, "n_te_total"].dropna().values
+                  for g in order]
+        if all(len(g) >= 3 for g in groups):
+            U, p = stats.mannwhitneyu(groups[0], groups[1], alternative="two-sided")
+            stat_label = f"Mann–Whitney U\np = {p:.2e}"
+        else:
+            p = np.nan
+            stat_label = ""
+    else:
+        H, p = safe_kruskal(sub["n_te_total"], sub[cat_col])
+        stat_label = f"Kruskal–Wallis\np = {p:.2e}"
     if not np.isnan(p):
-        ax.text(0.97, 0.03, f"Kruskal–Wallis\np = {p:.2e}",
+        ax.text(0.97, 0.03, stat_label,
                 transform=ax.transAxes, fontsize=6.5,
                 ha="right", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white",
@@ -3846,7 +3861,8 @@ def panel_metagene_single(ax, metagene_df, panel_letter="D"):
             clip_on=False)
 
 
-def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E"):
+def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E",
+                          mutation_rate=None):
     """Stacked K2P density histograms, one strip per LTR-RT family.
 
     Family order follows LTR_AGE_FAMILY_ORDER (matching Panel C top-to-bottom).
@@ -3902,11 +3918,16 @@ def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E"):
         if not np.isnan(peak_x):
             ax.axvline(peak_x, color=color, lw=0.9, linestyle=":",
                        alpha=0.95, zorder=5)
+            peak_label = f"{peak_x:.3f}"
+            if mutation_rate:
+                mya = peak_x / (2 * mutation_rate) / 1e6
+                peak_label += f"\n~{mya:.1f} Mya"
             ax.text(peak_x + K2P_MAX * 0.015,
                     ax.get_ylim()[1] * 0.92 if ax.get_ylim()[1] > 0
                     else density.max() * 0.92,
-                    f"{peak_x:.3f}",
+                    peak_label,
                     fontsize=5.5, color="#222222", va="top", ha="left",
+                    linespacing=1.3,
                     bbox=dict(boxstyle="round,pad=0.15", fc="white",
                               ec="none", alpha=0.75))
 
@@ -3936,10 +3957,18 @@ def panel_ltr_age_density(axes, ltr_age_data, panel_letter="E"):
         axes[0].text(-0.06, 1.04, panel_letter, transform=axes[0].transAxes,
                      fontsize=11, fontweight="bold", va="bottom", ha="right",
                      clip_on=False)
+        # Secondary top axis showing estimated time (Mya)
+        if mutation_rate:
+            ax_top = axes[0].secondary_xaxis("top",
+                functions=(lambda k: k / (2 * mutation_rate) / 1e6,
+                           lambda t: t * 2 * mutation_rate * 1e6))
+            ax_top.set_xlabel("Estimated Age (Mya)", fontsize=6.5,
+                              labelpad=3)
+            ax_top.tick_params(labelsize=6)
 
 
 def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None,
-                            ltr_age=None):
+                            ltr_age=None, mutation_rate=None):
     """Page 6: panels A (intergenic regression), B (LTR-RT superfamily context),
     C (LTR-RT family context), D (collapsed metagene), E (K2P age distributions)."""
     print("    Loading GFF for gene-context page …")
@@ -4076,7 +4105,8 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None,
             n_age, 1, subplot_spec=right_gs[1, 0],
             hspace=0.08)
         axes_F = [fig.add_subplot(age_gs[i, 0]) for i in range(n_age)]
-        panel_ltr_age_density(axes_F, ltr_age, panel_letter="F")
+        panel_ltr_age_density(axes_F, ltr_age, panel_letter="F",
+                              mutation_rate=mutation_rate)
     else:
         # No age data: single collapsed metagene fills the right column
         right_gs = gridspec.GridSpecFromSubplotSpec(
@@ -4156,12 +4186,512 @@ def build_page_gene_context(pdf, merged, pos_df, gff_path, fai_lengths=None,
                         peak = np.nan
                 else:
                     peak = np.nan
-                print(f"      {fam:<18} [{sup:<3}] n={len(vals):>6,}  "
-                      f"mean={vals_c.mean():.4f}  med={np.median(vals_c):.4f}  "
-                      f"peak={peak:.4f}" if not np.isnan(peak) else
-                      f"      {fam:<18} [{sup:<3}] n={len(vals):>6,}  "
-                      f"mean={vals_c.mean():.4f}  med={np.median(vals_c):.4f}")
+                line = (f"      {fam:<18} [{sup:<3}] n={len(vals):>6,}  "
+                        f"mean={vals_c.mean():.4f}  med={np.median(vals_c):.4f}")
+                if not np.isnan(peak):
+                    line += f"  peak={peak:.4f}"
+                    if mutation_rate:
+                        mya = peak / (2 * mutation_rate) / 1e6
+                        line += f"  (~{mya:.1f} Mya)"
+                print(line)
+        # Ty1 vs Ty3 superfamily age comparison
+        ty1_vals = []
+        ty3_vals = []
+        for fam in LTR_AGE_FAMILY_ORDER:
+            if fam in ltr_age:
+                sup = FAMILY_TO_SUPERFAMILY.get(fam)
+                vals = np.array(ltr_age[fam], dtype=float)
+                vals_c = vals[vals <= 0.15]
+                if sup == "Ty1":
+                    ty1_vals.append(vals_c)
+                elif sup == "Ty3":
+                    ty3_vals.append(vals_c)
+        if ty1_vals and ty3_vals:
+            ty1_all = np.concatenate(ty1_vals)
+            ty3_all = np.concatenate(ty3_vals)
+            print(f"    Ty1 vs Ty3 superfamily K2P age comparison:")
+            print(f"      Ty1  n={len(ty1_all):>7,}  mean={ty1_all.mean():.4f}  "
+                  f"med={np.median(ty1_all):.4f}")
+            print(f"      Ty3  n={len(ty3_all):>7,}  mean={ty3_all.mean():.4f}  "
+                  f"med={np.median(ty3_all):.4f}")
+            if len(ty1_all) >= 3 and len(ty3_all) >= 3:
+                U, p_age = stats.mannwhitneyu(ty1_all, ty3_all,
+                                              alternative="two-sided")
+                rbc = 1 - (2 * U) / (len(ty1_all) * len(ty3_all))
+                older = "Ty1" if np.median(ty1_all) > np.median(ty3_all) else "Ty3"
+                print(f"      Mann–Whitney U={U:.0f}, p={p_age:.2e}  "
+                      f"(rank-biserial r={rbc:.3f})")
+                if p_age < 0.05:
+                    print(f"      → {older} is significantly older "
+                          f"(higher K2P divergence)")
+                else:
+                    print(f"      → No significant difference in age")
     print(f"    {'─'*_W}")
+
+
+def _get_gene_products(gff_path):
+    """Build a dict {gene_name: product_description} from mRNA lines in GFF."""
+    products = {}
+    with open(gff_path) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9 or parts[2] != "mRNA":
+                continue
+            attrs = parts[8]
+            gene_name = product = None
+            for seg in attrs.split(";"):
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    k = k.strip()
+                    if k == "gene":
+                        gene_name = v.strip()
+                    elif k == "product":
+                        product = unquote(v.strip())
+            if gene_name and product and gene_name not in products:
+                products[gene_name] = product
+    return products
+
+
+_PRODUCT_ABBREV = [
+    ("serine/threonine-protein",   "Ser/Thr-protein"),
+    ("serine/threonine protein",   "Ser/Thr-protein"),
+    ("domain-containing protein",  "domain protein"),
+    ("domain-containing",          "domain"),
+    ("carboxymethyltransferase",   "carboxymethyl-TF"),
+    ("methyltransferase",          "methyl-TF"),
+    ("acetyltransferase",          "acetyl-TF"),
+    ("glucosyltransferase",        "glucosyl-TF"),
+    ("transcription factor",       "TF"),
+    ("receptor-like kinase",       "RLK"),
+    ("protein kinase",             "kinase"),
+    (", chloroplastic",            " (chloroplast)"),
+    (", mitochondrial",            " (mito)"),
+    (", putative",                 ""),
+    ("transcript variant",         "variant"),
+    ("isoform X",                  "iso"),
+    ("uncharacterized protein",    "uncharacterized"),
+]
+
+
+def _abbrev_product(text, wrap_width=36):
+    """Apply domain-specific abbreviations to a gene product description,
+    then soft-wrap at word boundaries into at most 2 lines (no ellipsis)."""
+    import textwrap
+    if not text:
+        return text
+    t = text
+    for pat, rep in _PRODUCT_ABBREV:
+        t = t.replace(pat, rep)
+    t = " ".join(t.split())
+    if len(t) <= wrap_width:
+        return t
+    lines = textwrap.wrap(t, width=wrap_width, break_long_words=False,
+                          break_on_hyphens=True)
+    if len(lines) <= 2:
+        return "\n".join(lines)
+    # More than 2 lines: keep first line and pack remainder into line 2
+    return lines[0] + "\n" + " ".join(lines[1:])
+
+
+def build_page_cluster_table(pdf, clusters_df, pos_df, gff_path,
+                             genes_df, n_r_samp, n_s_samp):
+    """Render a publication-quality table of significant TE insertion clusters
+    with gene disruption annotations."""
+    if clusters_df.empty:
+        return
+    sig = clusters_df[clusters_df["enrichment"].isin(["R", "S"])].copy()
+    if sig.empty:
+        return
+    sig = sig.sort_values("padj")
+
+    n_total = len(clusters_df)
+    n_sig = len(sig)
+    n_R_e = int((sig["enrichment"] == "R").sum())
+    n_S_e = int((sig["enrichment"] == "S").sum())
+
+    # Load gene products from GFF
+    gene_products = _get_gene_products(gff_path) if gff_path else {}
+
+    fig = plt.figure(figsize=(11, 8.5))  # landscape
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    # Header
+    ax.text(0.50, 0.97,
+            "Significantly Enriched TE Insertion Clusters",
+            transform=ax.transAxes, fontsize=11, fontweight="bold",
+            va="top", ha="center")
+    ax.text(0.50, 0.945,
+            f"Clusters tested: {n_total:,}    "
+            f"Significant (q < 0.05): {n_sig}    "
+            f"(R-enriched: {n_R_e},  S-enriched: {n_S_e})    "
+            f"R={n_r_samp},  S={n_s_samp} samples",
+            transform=ax.transAxes, fontsize=7.5, va="top", ha="center")
+
+    # Build table rows
+    col_labels = ["#", "Chr", "Position", "R", "S", "Total",
+                  "log₂FC", "q (BH)", "Enr", "TE identity",
+                  "Gene context", "Putative function"]
+
+    cell_text = []
+    cell_colors = []
+    for i, (_, row) in enumerate(sig.iterrows(), 1):
+        chrom = row["Chr"]
+        pos = int(row["pos"])
+        enr = row["enrichment"]
+
+        # TE identity
+        te_desc = describe_cluster_tes(chrom, pos, pos_df)
+        te_str = te_desc[0].split("  ")[0] if te_desc else "—"
+        # Shorten taxonomy: LTR/Ty3/Tekay -> Ty3/Tekay
+        te_str = te_str.replace("LTR/", "")
+
+        # Gene annotation
+        gene_str = "—"
+        func_str = "—"
+        if genes_df is not None and not genes_df.empty:
+            hits = annotate_insertion(chrom, pos, genes_df)
+            if hits:
+                best = sorted(hits, key=lambda x: (x["overlap"], x["dist_bp"]))[0]
+                if best["overlap"] == "INTERNAL":
+                    gene_str = f"{best['gene_name']} (exon/intron)"
+                else:
+                    gene_str = f"{best['gene_name']} (prom, {best['dist_bp']:,}bp)"
+                # Look up product
+                prod = gene_products.get(best["gene_name"], "")
+                if prod:
+                    func_str = _abbrev_product(prod)
+
+        cell_text.append([
+            str(i),
+            chrom,
+            f"{pos:,}",
+            str(int(row["r_count"])),
+            str(int(row["s_count"])),
+            str(int(row["total"])),
+            f"{row['log2fc']:+.3f}",
+            f"{row['padj']:.2e}",
+            enr,
+            te_str,
+            gene_str,
+            func_str,
+        ])
+        bg = "#fff0f0" if enr == "S" else ("#ffffff" if i % 2 == 1 else "#f5f5f5")
+        cell_colors.append(bg)
+
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                   cellLoc="center", colLoc="center",
+                   loc="upper center",
+                   bbox=[0.01, 0.02, 0.98, 0.88])
+
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(6)
+
+    # Column widths (proportional)
+    col_widths = [0.03, 0.10, 0.08, 0.03, 0.03, 0.04,
+                  0.06, 0.07, 0.03, 0.10, 0.18, 0.25]
+    total_w = sum(col_widths)
+    col_widths = [w / total_w for w in col_widths]
+
+    for j, w in enumerate(col_widths):
+        for i in range(len(cell_text) + 1):
+            tbl[i, j].set_width(w)
+
+    # Style header
+    for j in range(len(col_labels)):
+        cell = tbl[0, j]
+        cell.set_facecolor("#4C72B0")
+        cell.set_text_props(color="white", fontweight="bold", fontsize=6.5)
+        cell.set_edgecolor("white")
+
+    # Style data rows
+    for i in range(len(cell_text)):
+        for j in range(len(col_labels)):
+            cell = tbl[i + 1, j]
+            cell.set_facecolor(cell_colors[i])
+            cell.set_edgecolor("#dddddd")
+            cell.set_text_props(fontsize=6)
+            # Left-align text columns
+            if j in (1, 10, 11):
+                cell.set_text_props(ha="left")
+            # Color enrichment
+            if j == 8:
+                color = "#c44e52" if cell_text[i][8] == "S" else "#4c72b0"
+                cell.set_text_props(fontweight="bold", color=color)
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ── RepeatMasker .tbl parser ────────────────────────────────────────────────
+
+def parse_repeatmasker_tbl(path):
+    """Parse a RepeatMasker `.tbl` summary file.
+
+    Returns
+    -------
+    summary : dict
+        File-level stats: file_name, n_sequences, total_length_bp,
+        total_length_excl_n_bp, gc_pct, masked_bp, masked_pct.
+        Missing fields are set to None.
+    rows : list[dict]
+        One dict per surviving body row, in source order, with keys:
+        label, indent_level (0|1|2), n_elements (int), length_bp (int),
+        pct (float), is_total (bool).
+        Rows with n_elements == 0 AND length_bp == 0 are dropped.
+    """
+    import re
+
+    summary = {
+        "file_name": None,
+        "n_sequences": None,
+        "total_length_bp": None,
+        "total_length_excl_n_bp": None,
+        "gc_pct": None,
+        "masked_bp": None,
+        "masked_pct": None,
+    }
+
+    # Body-row matcher: capture trailing "<int> <int> bp <float> %"
+    # (label is everything before that, including its leading whitespace).
+    row_re = re.compile(
+        r"^(?P<label>.*?)\s+(?P<n>\d[\d,]*)\s+(?P<bp>\d[\d,]*)\s*bp\s+"
+        r"(?P<pct>\d+(?:\.\d+)?)\s*%\s*$"
+    )
+    # "Total interspersed repeats" line is special: no element count, just
+    # "<text>: <bp> bp <pct> %".
+    total_re = re.compile(
+        r"^(?P<label>Total interspersed repeats):\s+"
+        r"(?P<bp>\d[\d,]*)\s*bp\s+(?P<pct>\d+(?:\.\d+)?)\s*%\s*$"
+    )
+    # Header lines.
+    fname_re   = re.compile(r"^file name:\s*(?P<v>\S+)")
+    nseq_re    = re.compile(r"^sequences:\s*(?P<v>\d+)")
+    tlen_re    = re.compile(
+        r"^total length:\s*(?P<v>\d[\d,]*)\s*bp"
+        r"(?:\s*\((?P<excl>\d[\d,]*)\s*bp\s+excl\s+N/X-runs\))?"
+    )
+    gc_re      = re.compile(r"^GC level:\s*(?P<v>\d+(?:\.\d+)?)\s*%")
+    masked_re  = re.compile(
+        r"^bases masked:\s*(?P<bp>\d[\d,]*)\s*bp\s*\(\s*(?P<pct>\d+(?:\.\d+)?)\s*%\s*\)"
+    )
+
+    def _to_int(s):
+        return int(s.replace(",", ""))
+
+    rows = []
+    # Track the most recently parsed body row even if it was dropped, so that
+    # continuation lines (e.g. "P-element, Transib)" following a zero "Other
+    # (Mirage,..." row) attach to the correct row rather than leaking onto a
+    # later surviving row.
+    last_row = None
+
+    try:
+        f = open(path, "r")
+    except OSError as e:
+        sys.exit(f"ERROR: cannot open --repeatmasker-tbl {path}: {e}")
+
+    with f:
+        in_body = False
+        for raw in f:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+
+            # ── Header parsing (before/around the dashed separator) ──
+            m = fname_re.match(stripped)
+            if m:
+                summary["file_name"] = m.group("v")
+                continue
+            m = nseq_re.match(stripped)
+            if m:
+                summary["n_sequences"] = int(m.group("v"))
+                continue
+            m = tlen_re.match(stripped)
+            if m:
+                summary["total_length_bp"] = _to_int(m.group("v"))
+                if m.group("excl"):
+                    summary["total_length_excl_n_bp"] = _to_int(m.group("excl"))
+                continue
+            m = gc_re.match(stripped)
+            if m:
+                summary["gc_pct"] = float(m.group("v"))
+                continue
+            m = masked_re.match(stripped)
+            if m:
+                summary["masked_bp"] = _to_int(m.group("bp"))
+                summary["masked_pct"] = float(m.group("pct"))
+                continue
+
+            # The dashed line marks the start of the body.
+            if stripped.startswith("---"):
+                in_body = True
+                continue
+            if not in_body:
+                continue
+
+            # Stop body parsing at the trailing "====" separator.
+            if stripped.startswith("===="):
+                in_body = False
+                continue
+
+            # Skip blank lines and the column-header line(s) inside body.
+            if not stripped:
+                continue
+            if stripped.startswith(("number of", "elements*", "* most", "RepeatMasker",
+                                    "run with", "The query", "FamDB")):
+                continue
+
+            # Continuation line (no numeric columns, indented). Append to
+            # the previous row's label — even if that row was dropped.
+            if last_row is not None and not row_re.match(line) \
+                    and not total_re.match(line) and line.startswith(" "):
+                last_row["label"] = (last_row["label"].rstrip() + " "
+                                     + stripped).strip()
+                continue
+
+            # Total interspersed repeats — special row.
+            m = total_re.match(line)
+            if m:
+                row = {
+                    "label": m.group("label").strip(),
+                    "indent_level": 0,
+                    "n_elements": None,
+                    "length_bp": _to_int(m.group("bp")),
+                    "pct": float(m.group("pct")),
+                    "is_total": True,
+                }
+                rows.append(row)
+                last_row = row
+                continue
+
+            m = row_re.match(line)
+            if m:
+                # Indent level from leading whitespace in the original line:
+                # 0 chars → 0, 1–3 chars → 1, 4+ chars → 2.
+                lead = len(line) - len(line.lstrip(" "))
+                if lead == 0:
+                    level = 0
+                elif lead <= 3:
+                    level = 1
+                else:
+                    level = 2
+                n_el = _to_int(m.group("n"))
+                bp   = _to_int(m.group("bp"))
+                row = {
+                    "label": m.group("label").strip().rstrip(":"),
+                    "indent_level": level,
+                    "n_elements": n_el,
+                    "length_bp": bp,
+                    "pct": float(m.group("pct")),
+                    "is_total": False,
+                }
+                last_row = row
+                # Drop zero rows from the kept list, but keep `last_row` so
+                # any continuation line still attaches to it.
+                if n_el == 0 and bp == 0:
+                    continue
+                rows.append(row)
+                continue
+
+            # Anything else in the body that we don't understand: warn + skip.
+            print(f"WARNING: skipping unrecognised .tbl line: {line!r}",
+                  file=sys.stderr)
+
+    return summary, rows
+
+
+def build_page_repeatmasker(pdf, summary, rows):
+    """Render a single appendix page summarising the reference repeat
+    composition parsed from a RepeatMasker .tbl file.
+    """
+    fig = plt.figure(figsize=(11, 8.5))
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+
+    # ── Title ──────────────────────────────────────────────────────────
+    ax.text(0.05, 0.96, "Reference genome repeat composition",
+            transform=ax.transAxes,
+            fontsize=13, fontweight="bold", va="top", ha="left")
+
+    # ── Summary header ────────────────────────────────────────────────
+    def _fmt_int(v):
+        return f"{v:,}" if isinstance(v, int) else "—"
+    def _fmt_pct(v):
+        return f"{v:.2f}%" if isinstance(v, (int, float)) else "—"
+
+    line1 = (f"File: {summary.get('file_name') or '—'}    "
+             f"Sequences: {_fmt_int(summary.get('n_sequences'))}    "
+             f"Total length: {_fmt_int(summary.get('total_length_bp'))} bp")
+    line2 = (f"GC: {_fmt_pct(summary.get('gc_pct'))}    "
+             f"Masked: {_fmt_int(summary.get('masked_bp'))} bp "
+             f"({_fmt_pct(summary.get('masked_pct'))})")
+
+    ax.text(0.05, 0.91, line1, transform=ax.transAxes,
+            fontsize=9, fontfamily="monospace", va="top", ha="left")
+    ax.text(0.05, 0.88, line2, transform=ax.transAxes,
+            fontsize=9, fontfamily="monospace", va="top", ha="left")
+
+    ax.text(0.05, 0.84,
+            "Source: RepeatMasker .tbl. Rows with zero elements omitted.",
+            transform=ax.transAxes, fontsize=8, fontstyle="italic",
+            color="#555555", va="top", ha="left")
+
+    # ── Table body ────────────────────────────────────────────────────
+    # Use figure-spaces for indentation so matplotlib doesn't collapse them.
+    INDENT = "\u2003\u2003"  # two em-spaces per level
+
+    cell_text   = []
+    row_colors  = []
+    for r in rows:
+        label_str = INDENT * r["indent_level"] + r["label"]
+        n_str   = "—" if r["n_elements"] is None else f"{r['n_elements']:,}"
+        bp_str  = f"{r['length_bp']:,}"
+        pct_str = f"{r['pct']:.2f}%"
+        cell_text.append([label_str, n_str, bp_str, pct_str])
+        if r["is_total"]:
+            row_colors.append("#eeeeee")
+        elif r["indent_level"] == 0:
+            row_colors.append("#f7f7f7")
+        else:
+            row_colors.append("white")
+
+    col_labels = ["Category", "# elements", "Length (bp)", "% of sequence"]
+
+    # Position the table inside the figure (axes coordinates).
+    tbl = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc="left",
+        colLoc="left",
+        loc="upper left",
+        bbox=[0.05, 0.05, 0.90, 0.76],  # [x, y, width, height]
+        cellColours=[[c, c, c, c] for c in row_colors],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+
+    # Right-align numeric columns; bold the header and level-0 rows;
+    # bold + faint top rule on Total row.
+    for (row_idx, col_idx), cell in tbl.get_celld().items():
+        # row_idx == 0 is the header row.
+        if row_idx == 0:
+            cell.get_text().set_fontweight("bold")
+            cell.set_facecolor("#dddddd")
+        else:
+            r = rows[row_idx - 1]
+            if r["is_total"]:
+                cell.get_text().set_fontweight("bold")
+                cell.set_linewidth(0.8)
+                cell.set_edgecolor("#888888")
+            elif r["indent_level"] == 0:
+                cell.get_text().set_fontweight("bold")
+        if col_idx > 0:
+            cell.get_text().set_horizontalalignment("right")
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_page_command(pdf):
@@ -4478,7 +5008,22 @@ def main():
             print("    Page 6: gene-context enrichment, metagene & K2P age")
             build_page_gene_context(pdf, merged, pos_df, args.gff,
                                     fai_lengths=fai_lengths,
-                                    ltr_age=ltr_age)
+                                    ltr_age=ltr_age,
+                                    mutation_rate=args.mutation_rate)
+
+        if args.gff and not clusters_df.empty:
+            sig_check = clusters_df[clusters_df["enrichment"].isin(["R", "S"])]
+            if not sig_check.empty:
+                print("    Table page: significant TE insertion clusters")
+                genes_for_tbl = load_gff_genes(args.gff) if args.gff else None
+                build_page_cluster_table(pdf, clusters_df, pos_df, args.gff,
+                                         genes_for_tbl, n_r_samp, n_s_samp)
+
+        if args.repeatmasker_tbl:
+            print(f"    Appendix page: RepeatMasker composition "
+                  f"({args.repeatmasker_tbl})")
+            rm_summary, rm_rows = parse_repeatmasker_tbl(args.repeatmasker_tbl)
+            build_page_repeatmasker(pdf, rm_summary, rm_rows)
 
         print("    Final page: command reproducibility")
         build_page_command(pdf)
